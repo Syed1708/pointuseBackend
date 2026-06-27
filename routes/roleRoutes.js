@@ -1,5 +1,6 @@
 const express = require('express');
 const router = express.Router();
+
 const Role = require('../models/Role');
 const User = require('../models/User');
 const { authenticateToken, requirePermission } = require('../middleware/auth');
@@ -55,15 +56,41 @@ router.post('/',
 );
 
 // ==========================================
-// 2. GET ALL ROLES (Admins & Managers)
+// 2. GET ALL ROLES with Pagination & Search (Admins & Managers)
 // ==========================================
+
 router.get('/', 
   authenticateToken, 
   requirePermission('employees:view'), 
   async (req, res) => {
     try {
-      const roles = await Role.find();
-      res.json(roles);
+      const page = parseInt(req.query.page) || 1;
+      const limit = parseInt(req.query.limit) || 10;
+      const search = req.query.search || '';
+
+      let query = {};
+
+      // If search query is provided, search by Role Name (case-insensitive)
+      if (search) {
+        query.name = { $regex: search, $options: 'i' };
+      }
+
+      const totalDocs = await Role.countDocuments(query);
+      const totalPages = Math.ceil(totalDocs / limit);
+      const skip = (page - 1) * limit;
+
+      const roles = await Role.find(query)
+        .skip(skip)
+        .limit(limit);
+
+      // Return standard Pagination payload [3]
+      res.json({
+        docs: roles,
+        totalPages,
+        totalDocs,
+        page
+      });
+
     } catch (err) {
       res.status(500).json({ message: 'Server error', error: err.message });
     }
@@ -179,5 +206,11 @@ router.delete('/:id',
     }
   }
 );
+
+
+
+
+
+
 
 module.exports = router;
