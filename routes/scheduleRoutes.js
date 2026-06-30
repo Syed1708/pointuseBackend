@@ -6,6 +6,7 @@ const User = require('../models/User');
 const Role = require('../models/Role');
 const nodemailer = require('nodemailer');
 const { authenticateToken, requirePermission } = require('../middleware/auth');
+const asyncHandler = require('../helpers/asyncHandler'); // 🛑 Import the centralized async wrapper [2]
 
 // Helper: Calculate scheduled hours for a single day
 const calculateDayHours = (day) => {
@@ -35,304 +36,244 @@ const calculateWeeklyHours = (days) => {
 // ==========================================
 // 1. GET WEEKLY GRID (For Managers/Admins)
 // ==========================================
-router.get('/grid', authenticateToken, requirePermission('schedules:view'), async (req, res) => {
-  try {
-    const { weekStartDate } = req.query; // Expects "YYYY-MM-DD" representing a Monday
-    if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required' });
+router.get('/grid', authenticateToken, requirePermission('schedules:view'), asyncHandler(async (req, res) => {
+  const { weekStartDate } = req.query; // Expects "YYYY-MM-DD" representing a Monday
+  if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required' });
 
-    // Fetch all active employees
-    const employeeRole = await Role.findOne({ name: 'employee' });
-    const employees = await User.find({ role: employeeRole._id }).select('name email contractHours');
+  // Fetch all active employees
+  const employeeRole = await Role.findOne({ name: 'employee' });
+  const employees = await User.find({ role: employeeRole._id }).select('name email contractHours');
 
-    const grid = [];
-    for (const emp of employees) {
-      // 🛑 FIXED: Query directly using the raw string weekStartDate
-      let schedule = await WeeklySchedule.findOne({ employee: emp._id, weekStartDate: weekStartDate });
-      
-      // If no schedule exists yet, return a default template
-      if (!schedule) {
-        schedule = {
-          employee: emp,
-          weekStartDate: weekStartDate,
-          status: 'draft',
-          days: {
-            monday: { isOff: true, shifts: [] },
-            tuesday: { isOff: true, shifts: [] },
-            wednesday: { isOff: true, shifts: [] },
-            thursday: { isOff: true, shifts: [] },
-            friday: { isOff: true, shifts: [] },
-            saturday: { isOff: true, shifts: [] },
-            sunday: { isOff: true, shifts: [] },
-          },
-          totalHours: 0
-        };
-      }
-      grid.push({ employee: emp, schedule });
+  const grid = [];
+  for (const emp of employees) {
+    // 🛑 Query directly using the raw string weekStartDate
+    let schedule = await WeeklySchedule.findOne({ employee: emp._id, weekStartDate: weekStartDate });
+    
+    // If no schedule exists yet, return a default template
+    if (!schedule) {
+      schedule = {
+        employee: emp,
+        weekStartDate: weekStartDate,
+        status: 'draft',
+        days: {
+          monday: { isOff: true, shifts: [] },
+          tuesday: { isOff: true, shifts: [] },
+          wednesday: { isOff: true, shifts: [] },
+          thursday: { isOff: true, shifts: [] },
+          friday: { isOff: true, shifts: [] },
+          saturday: { isOff: true, shifts: [] },
+          sunday: { isOff: true, shifts: [] },
+        },
+        totalHours: 0
+      };
     }
-
-    res.json(grid);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+    grid.push({ employee: emp, schedule });
   }
-});
+
+  res.json(grid);
+}));
 
 // ==========================================
 // 2. CREATE / UPDATE WEEKLY SCHEDULE (Chef/Manager/Admin)
 // ==========================================
-router.post('/save', authenticateToken, requirePermission('schedules:create'), async (req, res) => {
-  try {
-    const { employeeId, weekStartDate, days } = req.body;
+router.post('/save', authenticateToken, requirePermission('schedules:create'), asyncHandler(async (req, res) => {
+  const { employeeId, weekStartDate, days } = req.body;
 
-    const totalHours = calculateWeeklyHours(days);
+  const totalHours = calculateWeeklyHours(days);
 
-    // 🛑 FIXED: Query directly using the raw string weekStartDate
-    const schedule = await WeeklySchedule.findOneAndUpdate(
-      { employee: employeeId, weekStartDate: weekStartDate },
-      { employee: employeeId, weekStartDate: weekStartDate, days, totalHours },
-      { new: true, upsert: true }
-    );
+  // 🛑 Query directly using the raw string weekStartDate
+  const schedule = await WeeklySchedule.findOneAndUpdate(
+    { employee: employeeId, weekStartDate: weekStartDate },
+    { employee: employeeId, weekStartDate: weekStartDate, days, totalHours },
+    { new: true, upsert: true }
+  );
 
-    res.json({ message: 'Schedule saved successfully', schedule });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
+  res.json({ message: 'Schedule saved successfully', schedule });
+}));
 
 // ==========================================
 // 3. CLONE WEEK SCHEDULE
 // ==========================================
-router.post('/clone', authenticateToken, requirePermission('schedules:create'), async (req, res) => {
-  try {
-    const { sourceWeekStart, targetWeekStart } = req.body;
-
-    // 🛑 FIXED: Query directly using the raw string sourceWeekStart
-    const sourceSchedules = await WeeklySchedule.find({ weekStartDate: sourceWeekStart });
-    if (sourceSchedules.length === 0) {
-      return res.status(404).json({ message: 'No schedules found in the source week to clone.' });
-    }
-
-    for (const source of sourceSchedules) {
-      // 🛑 FIXED: Query directly using the raw string targetWeekStart
-      await WeeklySchedule.findOneAndUpdate(
-        { employee: source.employee, weekStartDate: targetWeekStart },
-        { 
-          employee: source.employee, 
-          weekStartDate: targetWeekStart, 
-          days: source.days, 
-          status: 'draft', // Cloned schedules start as drafts
-          totalHours: source.totalHours 
-        },
-        { upsert: true }
-      );
-    }
-
-    res.json({ message: 'Week successfully cloned as draft.' });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+router.post('/clone', authenticateToken, requirePermission('schedules:create'), asyncHandler(async (req, res) => {
+  const { sourceWeekStart, targetWeekStart } = req.body;
+console.log(`Cloning schedules from ${sourceWeekStart} to ${targetWeekStart}`);
+  // 🛑 Query directly using the raw string sourceWeekStart
+  const sourceSchedules = await WeeklySchedule.find({ weekStartDate: sourceWeekStart });
+  if (sourceSchedules.length === 0) {
+    return res.status(404).json({ message: 'No schedules found in the source week to clone.' });
   }
-});
+
+  for (const source of sourceSchedules) {
+    // 🛑 Query directly using the raw string targetWeekStart
+    await WeeklySchedule.findOneAndUpdate(
+      { employee: source.employee, weekStartDate: targetWeekStart },
+      { 
+        employee: source.employee, 
+        weekStartDate: targetWeekStart, 
+        days: source.days, 
+        status: 'draft', // Cloned schedules start as drafts
+        totalHours: source.totalHours 
+      },
+      { upsert: true }
+    );
+  }
+
+  res.json({ message: 'Week successfully cloned as draft.' });
+}));
 
 
 // ==========================================
 // 4. PUBLISH SCHEDULE & EMAIL PDF ATTACHMENT
 // ==========================================
-router.post('/publish', authenticateToken, requirePermission('schedules:publish'), async (req, res) => {
-  try {
-    const { weekStartDate } = req.body;
-    const targetDate = new Date(weekStartDate);
+router.post('/publish', authenticateToken, requirePermission('schedules:publish'), asyncHandler(async (req, res) => {
+  const { weekStartDate } = req.body;
+  const targetDate = new Date(weekStartDate);
 
-    // 🛑 FIXED: Query directly using the raw string weekStartDate
-    const result = await WeeklySchedule.updateMany({ weekStartDate: weekStartDate }, { status: 'published' });
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ message: 'No schedules found to publish.' });
-    }
-
-    // Fetch full active grid data to generate PDF
-    const employeeRole = await Role.findOne({ name: 'employee' });
-    const employees = await User.find({ role: employeeRole._id });
-    
-    // 🛑 FIXED: Query directly using the raw string weekStartDate
-    const schedules = await WeeklySchedule.find({ weekStartDate: weekStartDate }).populate('employee');
-
-        const defaultDays = {
-      monday: { isOff: true, shifts: [] },
-      tuesday: { isOff: true, shifts: [] },
-      wednesday: { isOff: true, shifts: [] },
-      thursday: { isOff: true, shifts: [] },
-      friday: { isOff: true, shifts: [] },
-      saturday: { isOff: true, shifts: [] },
-      sunday: { isOff: true, shifts: [] }
-    };
-
-    
-    const gridData = employees.map(emp => {
-      const sched = schedules.find(s => s.employee._id.toString() === emp._id.toString());
-      return {
-        employee: emp,
-        schedule: sched || { days: defaultDays } 
-      };
-    });
-
-    const pdfBuffer = await generateSchedulePDF(gridData, weekStartDate);
-    const weekNo = getWeekNumber(targetDate);
-
-    // Configure Nodemailer (Attaching the PDF Buffer)
-    const mailOptions = {
-      from: process.env.EMAIL_USER,
-      to: employees.map(e => e.email).filter(Boolean).join(','),
-      subject: `[Pointuse] Votre Planning - Semaine de ${weekNo}`,
-      text: `Bonjour, veuillez trouver ci-joint le planning validé pour la Semaine de ${weekNo}.`,
-      attachments: [
-        {
-          filename: `Planning_Semaine_${weekNo}.pdf`,
-          content: pdfBuffer,
-          contentType: 'application/pdf'
-        }
-      ]
-    };
-
-    const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
-    });
-
-    await transporter.sendMail(mailOptions);
-
-    res.json({ message: 'Schedules published and PDF emailed successfully.' });
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+  // 🛑 Query directly using the raw string weekStartDate
+  const result = await WeeklySchedule.updateMany({ weekStartDate: weekStartDate }, { status: 'published' });
+  if (result.matchedCount === 0) {
+    return res.status(404).json({ message: 'No schedules found to publish.' });
   }
-});
+
+  // Fetch full active grid data to generate PDF
+  const employeeRole = await Role.findOne({ name: 'employee' });
+  const employees = await User.find({ role: employeeRole._id });
+  
+  // 🛑 Query directly using the raw string weekStartDate
+  const schedules = await WeeklySchedule.find({ weekStartDate: weekStartDate }).populate('employee');
+
+  const defaultDays = {
+    monday: { isOff: true, shifts: [] },
+    tuesday: { isOff: true, shifts: [] },
+    wednesday: { isOff: true, shifts: [] },
+    thursday: { isOff: true, shifts: [] },
+    friday: { isOff: true, shifts: [] },
+    saturday: { isOff: true, shifts: [] },
+    sunday: { isOff: true, shifts: [] }
+  };
+
+  const gridData = employees.map(emp => {
+    const sched = schedules.find(s => s.employee._id.toString() === emp._id.toString());
+    return {
+      employee: emp,
+      schedule: sched || { days: defaultDays } 
+    };
+  });
+
+  const pdfBuffer = await generateSchedulePDF(gridData, weekStartDate);
+  const weekNo = getWeekNumber(targetDate);
+
+  // Configure Nodemailer (Attaching the PDF Buffer)
+  const mailOptions = {
+    from: process.env.EMAIL_USER,
+    to: employees.map(e => e.email).filter(Boolean).join(','),
+    subject: `[Pointuse] Votre Planning - Semaine de ${weekNo}`,
+    text: `Bonjour, veuillez trouver ci-joint le planning validé pour la Semaine de ${weekNo}.`,
+    attachments: [
+      {
+        filename: `Planning_Semaine_${weekNo}.pdf`,
+        content: pdfBuffer,
+        contentType: 'application/pdf'
+      }
+    ]
+  };
+
+  const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
+  });
+
+  await transporter.sendMail(mailOptions);
+
+  res.json({ message: 'Schedules published and PDF emailed successfully.' });
+}));
 
 // ==========================================
 // 6. DOWNLOAD DIRECT PLANNING PDF
 // ==========================================
-router.get('/download-pdf', authenticateToken, requirePermission('schedules:view'), async (req, res) => {
-  try {
-    const { weekStartDate } = req.query;
-    if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required' });
+router.get('/download-pdf', authenticateToken, requirePermission('schedules:view'), asyncHandler(async (req, res) => {
+  const { weekStartDate } = req.query;
+  if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required' });
 
-    const targetDate = new Date(weekStartDate);
+  const targetDate = new Date(weekStartDate);
 
-    // Fetch active grid
-    const employeeRole = await Role.findOne({ name: 'employee' });
-    const employees = await User.find({ role: employeeRole._id });
-    
-    // 🛑 FIXED: Query directly using the raw string weekStartDate
-    const schedules = await WeeklySchedule.find({ weekStartDate: weekStartDate }).populate('employee');
+  // Fetch active grid
+  const employeeRole = await Role.findOne({ name: 'employee' });
+  const employees = await User.find({ role: employeeRole._id });
+  
+  // 🛑 Query directly using the raw string weekStartDate
+  const schedules = await WeeklySchedule.find({ weekStartDate: weekStartDate }).populate('employee');
 
-        const defaultDays = {
-      monday: { isOff: true, shifts: [] },
-      tuesday: { isOff: true, shifts: [] },
-      wednesday: { isOff: true, shifts: [] },
-      thursday: { isOff: true, shifts: [] },
-      friday: { isOff: true, shifts: [] },
-      saturday: { isOff: true, shifts: [] },
-      sunday: { isOff: true, shifts: [] }
+  const defaultDays = {
+    monday: { isOff: true, shifts: [] },
+    tuesday: { isOff: true, shifts: [] },
+    wednesday: { isOff: true, shifts: [] },
+    thursday: { isOff: true, shifts: [] },
+    friday: { isOff: true, shifts: [] },
+    saturday: { isOff: true, shifts: [] },
+    sunday: { isOff: true, shifts: [] }
+  };
+  const gridData = employees.map(emp => {
+    const sched = schedules.find(s => s.employee._id.toString() === emp._id.toString());
+    return {
+      employee: emp,
+      schedule: sched || { days: defaultDays } 
     };
-    const gridData = employees.map(emp => {
-      const sched = schedules.find(s => s.employee._id.toString() === emp._id.toString());
-      return {
-        employee: emp,
-        schedule: sched || { days: defaultDays } 
-      };
-    });
+  });
 
-    // Generate and Stream PDF directly to HTTP Client response
-    const pdfBuffer = await generateSchedulePDF(gridData, weekStartDate);
-    const weekNo = getWeekNumber(targetDate);
+  // Generate and Stream PDF directly to HTTP Client response
+  const pdfBuffer = await generateSchedulePDF(gridData, weekStartDate);
+  const weekNo = getWeekNumber(targetDate);
 
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=Planning_Semaine_${weekNo}.pdf`);
-    res.send(pdfBuffer);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
-
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename=Planning_Semaine_${weekNo}.pdf`);
+  res.send(pdfBuffer);
+}));
 
 // ==========================================
 // 7. DOWNLOAD PERSONAL SCHEDULE PDF (Employee Only)
 // ==========================================
-router.get('/my-schedule-pdf', authenticateToken, async (req, res) => {
-  try {
-    const { weekStartDate } = req.query; // e.g. "2026-06-22"
-    if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required' });
+router.get('/my-schedule-pdf', authenticateToken, asyncHandler(async (req, res) => {
+  const { weekStartDate } = req.query; // e.g. "2026-06-22"
+  if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required' });
 
-    // Fetch this employee's published schedule for the week [2]
-    const schedule = await WeeklySchedule.findOne({
-      employee: req.user.id,
-      weekStartDate: weekStartDate,
-      status: 'published'
-    }).populate('employee', 'name email');
+  // Fetch this employee's published schedule for the week
+  const schedule = await WeeklySchedule.findOne({
+    employee: req.user.id,
+    weekStartDate: weekStartDate,
+    status: 'published'
+  }).populate('employee', 'name email');
 
-    if (!schedule) {
-      return res.status(404).json({ message: 'No published schedule found for this week.' });
-    }
-
-    // Generate and stream personal PDF [1.2.4, 2]
-    const pdfBuffer = await generatePersonalPDF(schedule, weekStartDate);
-    const weekNo = getWeekNumber(new Date(weekStartDate));
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=My_Planning_Semaine_${weekNo}.pdf`);
-    res.send(pdfBuffer);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+  if (!schedule) {
+    return res.status(404).json({ message: 'No published schedule found for this week.' });
   }
-});
 
-// ==========================================
-// 7. DOWNLOAD PERSONAL SCHEDULE PDF (Employee Only)
-// ==========================================
-router.get('/my-schedule-pdf', authenticateToken, async (req, res) => {
-  try {
-    const { weekStartDate } = req.query; // e.g. "2026-06-22"
-    if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required' });
+  // Generate and stream personal PDF [1.2.4]
+  const pdfBuffer = await generatePersonalPDF(schedule, weekStartDate);
+  const weekNo = getWeekNumber(new Date(weekStartDate));
 
-    // Fetch this employee's published schedule for the week [2]
-    const schedule = await WeeklySchedule.findOne({
-      employee: req.user.id,
-      weekStartDate: weekStartDate,
-      status: 'published'
-    }).populate('employee', 'name email');
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename=My_Planning_Semaine_${weekNo}.pdf`);
+  res.send(pdfBuffer);
+}));
 
-    if (!schedule) {
-      return res.status(404).json({ message: 'No published schedule found for this week.' });
-    }
-
-    // Generate and stream personal PDF [1.2.4, 2]
-    const pdfBuffer = await generatePersonalPDF(schedule, weekStartDate);
-    const weekNo = getWeekNumber(new Date(weekStartDate));
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=My_Planning_Semaine_${weekNo}.pdf`);
-    res.send(pdfBuffer);
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
-  }
-});
 // ==========================================
 // 5. GET EMPLOYEE OWN PUBLISHED SCHEDULE (Employee Only)
 // ==========================================
-router.get('/my-schedule', authenticateToken, async (req, res) => {
-  try {
-    const { weekStartDate } = req.query;
-    if (!weekStartDate) {
-      return res.status(400).json({ message: 'weekStartDate parameter is required' });
-    }
-
-    // 🛑 FIXED: Query directly using the raw string weekStartDate
-    const schedule = await WeeklySchedule.findOne({
-      employee: req.user.id,
-      weekStartDate: weekStartDate,
-      status: 'published'
-    }).populate('employee', 'name email');
-
-    res.json(schedule); 
-  } catch (err) {
-    res.status(500).json({ message: 'Server error', error: err.message });
+router.get('/my-schedule', authenticateToken, asyncHandler(async (req, res) => {
+  const { weekStartDate } = req.query;
+  if (!weekStartDate) {
+    return res.status(400).json({ message: 'weekStartDate parameter is required' });
   }
-});
+
+  // 🛑 Query directly using the raw string weekStartDate
+  const schedule = await WeeklySchedule.findOne({
+    employee: req.user.id,
+    weekStartDate: weekStartDate,
+    status: 'published'
+  }).populate('employee', 'name email');
+
+  res.json(schedule); 
+}));
 
 module.exports = router;
