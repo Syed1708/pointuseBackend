@@ -49,6 +49,8 @@ router.post(
     });
     await newUser.save();
 
+    req.app.get('io').emit('user_updated'); // 🔌 Broadcast
+
     res.status(201).json({
       message: "User created successfully.",
       user: {
@@ -234,6 +236,8 @@ router.put(
 
     await targetUser.save();
 
+    req.app.get('io').emit('user_updated'); // 🔌 Broadcast
+
     res.json({
       message: "User updated successfully.",
       user: {
@@ -278,7 +282,8 @@ router.delete(
     }
 
     await User.findByIdAndDelete(targetUserId);
-
+    req.app.get('io').emit('user_updated'); // 🔌 Broadcast
+    
     res.json({
       message: `User ${targetUser.name} was successfully deleted.`,
     });

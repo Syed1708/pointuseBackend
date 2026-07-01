@@ -7,6 +7,7 @@ const Role = require('../models/Role');
 const nodemailer = require('nodemailer');
 const { authenticateToken, requirePermission } = require('../middleware/auth');
 const asyncHandler = require('../helpers/asyncHandler'); // 🛑 Import the centralized async wrapper [2]
+const Notification = require('../models/Notification');
 
 // Helper: Calculate scheduled hours for a single day
 const calculateDayHours = (day) => {
@@ -81,13 +82,22 @@ router.post('/save', authenticateToken, requirePermission('schedules:create'), a
 
   const totalHours = calculateWeeklyHours(days);
 
-  // 🛑 Query directly using the raw string weekStartDate
+  // // 🛑 Query directly using the raw string weekStartDate
+  // const schedule = await WeeklySchedule.findOneAndUpdate(
+  //   { employee: employeeId, weekStartDate: weekStartDate },
+  //   { employee: employeeId, weekStartDate: weekStartDate, days, totalHours },
+  //   { new: true, upsert: true }
+  // );
+
+    // 🛑 UPGRADED: Changed "new: true" to "returnDocument: 'after'" to resolve deprecation warnings [1]
   const schedule = await WeeklySchedule.findOneAndUpdate(
     { employee: employeeId, weekStartDate: weekStartDate },
     { employee: employeeId, weekStartDate: weekStartDate, days, totalHours },
-    { new: true, upsert: true }
+    { returnDocument: 'after', upsert: true } // 🛑 Fixed! [1]
   );
 
+  req.app.get('io').emit('schedule_updated'); // 🔌 Broadcast
+  
   res.json({ message: 'Schedule saved successfully', schedule });
 }));
 
@@ -103,8 +113,23 @@ console.log(`Cloning schedules from ${sourceWeekStart} to ${targetWeekStart}`);
     return res.status(404).json({ message: 'No schedules found in the source week to clone.' });
   }
 
-  for (const source of sourceSchedules) {
-    // 🛑 Query directly using the raw string targetWeekStart
+  // for (const source of sourceSchedules) {
+  //   // 🛑 Query directly using the raw string targetWeekStart
+  //   await WeeklySchedule.findOneAndUpdate(
+  //     { employee: source.employee, weekStartDate: targetWeekStart },
+  //     { 
+  //       employee: source.employee, 
+  //       weekStartDate: targetWeekStart, 
+  //       days: source.days, 
+  //       status: 'draft', // Cloned schedules start as drafts
+  //       totalHours: source.totalHours 
+  //     },
+  //     { upsert: true }
+  //   );
+  // }
+
+   for (const source of sourceSchedules) {
+    // 🛑 UPGRADED: Changed "new: true" to "returnDocument: 'after'" [1]
     await WeeklySchedule.findOneAndUpdate(
       { employee: source.employee, weekStartDate: targetWeekStart },
       { 
@@ -114,9 +139,11 @@ console.log(`Cloning schedules from ${sourceWeekStart} to ${targetWeekStart}`);
         status: 'draft', // Cloned schedules start as drafts
         totalHours: source.totalHours 
       },
-      { upsert: true }
+      { returnDocument: 'after', upsert: true } // 🛑 Fixed! [1]
     );
   }
+
+  req.app.get('io').emit('schedule_updated'); // 🔌 Broadcast
 
   res.json({ message: 'Week successfully cloned as draft.' });
 }));
@@ -184,6 +211,33 @@ router.post('/publish', authenticateToken, requirePermission('schedules:publish'
   });
 
   await transporter.sendMail(mailOptions);
+
+    // 🔌 1. EMIT DYNAMIC USER-SPECIFIC NOTIFICATIONS [2]
+  const userSockets = req.app.get('userSockets');
+  const io = req.app.get('io');
+
+  for (const emp of employees) {
+    // Write Notification to Database [2]
+    const notification = new Notification({
+      recipient: emp._id,
+      title: '📅 New Schedule Published!',
+      message: `Your work schedule for the week starting on ${weekStartDate} is now active.`,
+      type: 'schedule',
+      link: '/dashboard/planning'
+    });
+    await notification.save();
+
+    // If employee is currently online, send private socket packet directly to them [2]
+    const recipientSocketId = userSockets.get(emp._id.toString());
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('notification_received', notification);
+    }
+  }
+
+  // General fallback global broadcast (for admin/manager active dashboards) [2]
+  io.emit('schedule_published', { weekStartDate });
+
+  req.app.get('io').emit('schedule_published', { weekStartDate }); // 🔌 Broadcast with date payload [2]
 
   res.json({ message: 'Schedules published and PDF emailed successfully.' });
 }));

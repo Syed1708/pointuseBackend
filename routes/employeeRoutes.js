@@ -102,6 +102,8 @@ router.post(
 
     await newEmployee.save();
 
+    req.app.get('io').emit('user_updated'); // 🔌 Broadcast
+    
     res.status(201).json({
       message: "Employee created successfully.",
       user: {
