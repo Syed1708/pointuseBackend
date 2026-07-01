@@ -10,6 +10,7 @@ const employeeRoutes = require('./routes/employeeRoutes');
 const scheduleRoutes = require('./routes/scheduleRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes'); 
 const notificationRoutes = require('./routes/notificationRoutes'); 
+const timeclockRoutes = require('./routes/timeclockRoutes'); 
 const errorHandler = require('./middleware/errorHandler');
 const path = require('path'); 
 
@@ -63,6 +64,7 @@ app.use('/api/roles', roleRoutes);
 app.use('/api/employees', employeeRoutes);
 app.use('/api/schedules', scheduleRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/timeclock', timeclockRoutes);
 
 // 5. LISTEN FOR SOCKET CONNECTIONS
 io.on('connection', (socket) => {
