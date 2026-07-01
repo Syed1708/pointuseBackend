@@ -216,6 +216,10 @@ router.post('/publish', authenticateToken, requirePermission('schedules:publish'
   const userSockets = req.app.get('userSockets');
   const io = req.app.get('io');
 
+
+  // 🛑 1. DEBUG LOG: Print all currently online users registered in memory [2]
+  console.log("🔌 Live Sockets Online Registry Map:", Array.from(userSockets.entries()));
+
   for (const emp of employees) {
     // Write Notification to Database [2]
     const notification = new Notification({
@@ -227,8 +231,13 @@ router.post('/publish', authenticateToken, requirePermission('schedules:publish'
     });
     await notification.save();
 
-    // If employee is currently online, send private socket packet directly to them [2]
-    const recipientSocketId = userSockets.get(emp._id.toString());
+        // Fetch the socket ID for this specific employee
+    const employeeIdString = emp._id.toString();
+    const recipientSocketId = userSockets.get(employeeIdString);
+
+     // 🛑 2. DEBUG LOG: Verify if the system finds a matching socket ID for this employee [2]
+    console.log(`🔍 Target Employee: ${emp.name} | MongoDB ID: ${employeeIdString} | Socket ID Found: ${recipientSocketId}`);
+    
     if (recipientSocketId) {
       io.to(recipientSocketId).emit('notification_received', notification);
     }
