@@ -11,6 +11,7 @@ const scheduleRoutes = require('./routes/scheduleRoutes');
 const dashboardRoutes = require('./routes/dashboardRoutes'); 
 const notificationRoutes = require('./routes/notificationRoutes'); 
 const timeclockRoutes = require('./routes/timeclockRoutes'); 
+const leaveRoutes = require('./routes/leaveRoutes'); 
 const errorHandler = require('./middleware/errorHandler');
 const path = require('path'); 
 
@@ -65,6 +66,7 @@ app.use('/api/employees', employeeRoutes);
 app.use('/api/schedules', scheduleRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/timeclock', timeclockRoutes);
+app.use('/api/leaves', leaveRoutes); // 🛑 Added leaveRoutes for leave management
 
 // 5. LISTEN FOR SOCKET CONNECTIONS
 io.on('connection', (socket) => {
