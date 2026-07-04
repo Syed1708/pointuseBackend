@@ -383,7 +383,7 @@ router.post(
     }
 
     // Save the new avatar URL
-    const avatarUrl = `${process.env.APP_URL}/uploads/${req.file.filename}`;
+    const avatarUrl = `https://pointusebackend.onrender.com/uploads/${req.file.filename}`;
     user.avatar = avatarUrl;
     await user.save();
 
