@@ -77,7 +77,7 @@ io.on('connection', (socket) => {
   socket.on('register_user', (userId) => {
     if (userId) {
       userSockets.set(userId.toString(), socket.id); // Save the association [2]
-      console.log(`👤 User [${userId}] registered to Socket [${socket.id}]`);
+      // console.log(`👤 User [${userId}] registered to Socket [${socket.id}]`);
     }
   });
 
@@ -87,11 +87,11 @@ io.on('connection', (socket) => {
     for (const [userId, socketId] of userSockets.entries()) {
       if (socketId === socket.id) {
         userSockets.delete(userId); // Removes association [2]
-        console.log(`👤 User [${userId}] unregistered (disconnected).`);
+        // console.log(`👤 User [${userId}] unregistered (disconnected).`);
         break;
       }
     }
-    console.log('🔌 Client disconnected.');
+    // console.log('🔌 Client disconnected.');
   });
 });
 

@@ -9,7 +9,7 @@ const fs = require("fs");
 const { authenticateToken, requirePermission } = require("../middleware/auth");
 const { decrypt } = require("../helpers/cryptoHelper");
 const asyncHandler = require("../helpers/asyncHandler"); // 🛑 Import the centralized async wrapper [2]
-const API_URL = import.meta.env.VITE_API_URL;
+const API_URL = process.env.API_URL;
 
 // ==========================================
 // 1. CREATE NEW USER (Admins & Managers)
