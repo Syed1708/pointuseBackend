@@ -24,12 +24,29 @@ const app = express();
 // 2. CREATE THE HTTP SERVER (Wraps Express)
 const server = http.createServer(app);
 
+
+const allowedOrigins = [
+  'http://localhost:5173',
+  process.env.CLIENT_URL
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // allow tools like Postman or server-to-server calls
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+};
+
 // 3. INITIALIZE SOCKET.IO WITH CORS [2]
 const io = new Server(server, {
-  cors: {
-    origin: [process.env.CLIENT_URL, 'http://localhost:5173'], // Your Vite React Frontend URL [3]
-    credentials: true
-  }
+  cors: corsOptions
 });
 
 // 🛑 UPDATE A: CREATE THE IN-MEMORY USER SOCKET MAP [2]
@@ -45,10 +62,11 @@ app.set('userSockets', userSockets); // 🛑 Saved here!
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Middleware
-app.use(cors({
-  origin: [process.env.CLIENT_URL, 'http://localhost:5173'],
-  credentials: true
-}));
+
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
+
 app.use(express.json());
 app.use(cookieParser());
 
