@@ -332,7 +332,6 @@ router.post(
 router.post(
   "/verify",
     pinVerifyLimiter,
-  authenticateToken,
   asyncHandler(async (req, res) => {
     const { pinCode, action } = req.body;
 
