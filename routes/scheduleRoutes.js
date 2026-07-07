@@ -324,14 +324,18 @@ router.get('/my-schedule-pdf', authenticateToken, asyncHandler(async (req, res) 
 // 5. GET EMPLOYEE OWN PUBLISHED SCHEDULE (Employee Only)
 // ==========================================
 router.get('/my-schedule', authenticateToken, asyncHandler(async (req, res) => {
-  const { weekStartDate } = req.query;
+  const { weekStartDate, employeeId  } = req.query;
   if (!weekStartDate) {
     return res.status(400).json({ message: 'weekStartDate parameter is required' });
   }
 
-  // 🛑 Query directly using the raw string weekStartDate
+  // 🛑 2. UPGRADED SECURITY LOOKUP:
+  // If employeeId is passed, fetch that specific colleague's published schedule.
+  // Otherwise, default to the logged-in user's own ID [2].
+  const targetEmployeeId = employeeId || req.user.id;
+
   const schedule = await WeeklySchedule.findOne({
-    employee: req.user.id,
+    employee: targetEmployeeId, // 🛑 Dynamic target ID
     weekStartDate: weekStartDate,
     status: 'published'
   }).populate('employee', 'name email');

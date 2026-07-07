@@ -61,6 +61,23 @@ router.get(
 );
 
 // ==========================================
+//  GET COLLEAGUES LIST (Names & Avatars only for Shift Swaps - NO permission required!) [2]
+// ==========================================
+router.get('/colleagues', authenticateToken, asyncHandler(async (req, res) => {
+  // Find the 'employee' role document first
+  const employeeRole = await Role.findOne({ name: 'employee' });
+  if (!employeeRole) return res.json([]);
+
+  // Fetch only active employees, excluding the logged-in user's own profile [2]
+  const colleagues = await User.find({
+    role: employeeRole._id,
+    _id: { $ne: req.user.id } // 🛑 Exclude current user from the swap list! [2]
+  }).select('name avatar'); // 🛑 CRITICAL: Only retrieve name and avatar fields [2]
+
+  res.json(colleagues);
+}));
+
+// ==========================================
 // 2. CREATE EMPLOYEE (Automatically assigns 'employee' Role) [2]
 // ==========================================
 router.post(

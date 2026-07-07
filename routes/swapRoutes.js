@@ -203,9 +203,8 @@ router.put('/admin/:id/status', authenticateToken, requirePermission('employees:
   const receiverShiftObj = receiverShifts[request.receiverShiftIndex];
 
   // Swap the objects in their arrays securely [2]
-  senderShifts[request.senderShiftIndex] = receiverShiftObj;
-  receiverShifts[request.receiverIndex || 0] = senderShiftText; // let's use the clean assignment below:
-  receiverSchedule.days[receiverDayName].shifts[request.receiverShiftIndex] = senderShiftObj;
+ senderShifts[request.senderShiftIndex] = receiverShiftObj;
+  receiverShifts[request.receiverShiftIndex] = senderShiftObj;
 
   // Recalculate totals and save
   senderSchedule.totalHours = calculateWeeklyHours(senderSchedule.days);
