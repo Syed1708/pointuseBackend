@@ -8,6 +8,7 @@ const asyncHandler = require("../helpers/asyncHandler");
 const WeeklySchedule = require("../models/WeeklySchedule");
 const Role = require("../models/Role");
 const { pinVerifyLimiter } = require('../middleware/rateLimiter');
+const { getDistanceInMeters } = require("../utils/geoHelper");
 
 // Helper: Get YYYY-MM-DD in local timezone safely
 const getLocalDateString = () => {
@@ -39,6 +40,13 @@ const getWeekdayKey = (dateStr) => {
     "saturday",
   ];
   return weekdays[date.getDay()];
+};
+
+
+// Helper: Convert "10:00" to minutes past midnight
+const getMinutesFromTimeStr = (timeStr) => {
+  const [h, m] = timeStr.split(':').map(Number);
+  return h * 60 + m;
 };
 
 // ==========================================
@@ -326,139 +334,242 @@ router.post(
   }),
 );
 
+
 // ==========================================
-// STEP 1: VERIFY PIN & RETRIEVE IDENTITY
+// 1. STEP 1: VERIFY PIN, GPS, AND SCHEDULE ALIGNMENT [2]
 // ==========================================
-router.post(
-  "/verify",
-    pinVerifyLimiter,
-  asyncHandler(async (req, res) => {
-    const { pinCode, action } = req.body;
+router.post('/verify', asyncHandler(async (req, res) => {
+  const { pinCode, action, latitude, longitude } = req.body; // coordinates passed from client
 
-    if (!pinCode || !action) {
-      return res
-        .status(400)
-        .json({ message: "Le code PIN et l action sont requis." });
-    }
+  if (!pinCode || !action) {
+    return res.status(400).json({ message: 'Le code PIN et l action sont requis.' });
+  }
 
-    const users = await User.find({ pinCode: { $ne: null } }).populate("role");
-    const employee = users.find((u) => decrypt(u.pinCode) === pinCode);
+  // 1. Locate the employee by decrypting their stored PIN on the fly
+  const users = await User.find({ pinCode: { $ne: null } }).populate('role');
+  const employee = users.find(u => decrypt(u.pinCode) === pinCode);
 
-    if (!employee) {
-      return res
-        .status(400)
-        .json({ message: "Code PIN incorrect. Veuillez réessayer." });
-    }
+  if (!employee) {
+    return res.status(400).json({ message: 'Code PIN incorrect. Veuillez réessayer.' });
+  }
 
-    if (employee.role.name !== "employee") {
-      return res
-        .status(403)
-        .json({ message: "Seuls les employés peuvent utiliser la pointeuse." });
-    }
+  if (employee.role.name !== 'employee') {
+    return res.status(403).json({ message: 'Seuls les employés peuvent utiliser la pointeuse.' });
+  }
 
-    const activePunch = await Timeclock.findOne({
-      employee: employee._id,
-      checkOut: null,
-    });
+  // 🛑 2. GEOFENCING CHECK: Verify exact work location proximity [2]
+  // We check if coordinates are passed (always sent by phones, optional for locked terminal tablet)
+  if (latitude && longitude) {
+    const targetLat = parseFloat(process.env.RESTAURANT_LAT);
+    const targetLon = parseFloat(process.env.RESTAURANT_LON);
+    const maxRadius = parseFloat(process.env.ALLOWED_RADIUS_METERS || 100);
 
-    if (action === "arriver" && activePunch) {
-      return res.status(400).json({
-        message: `Vous êtes déjà arrivé ! Veuillez cliquer sur "Départ" pour terminer votre travail.`,
+    const distance = getDistanceInMeters(latitude, longitude, targetLat, targetLon);
+
+    if (distance > maxRadius) {
+      return res.status(403).json({ 
+        message: `Accès refusé : Vous devez être présent sur le lieu de travail pour pointer. (Distance actuelle: ${Math.round(distance)}m)` 
       });
     }
+  }
 
-    if (action === "depart" && !activePunch) {
-      return res.status(400).json({
-        message: `Vous n'êtes pas encore arrivé ! Veuillez d'abord cliquer sur "Arriver".`,
+  const todayStr = getLocalDateString();
+  const dayName = getWeekdayKey(todayStr); // e.g. "monday"
+  const weekStartStr = getMonday(todayStr);
+
+  const activePunch = await Timeclock.findOne({ employee: employee._id, checkOut: null });
+
+  // ------------------------------------------
+  // 🛑 3. SCHEDULE-ALIGNED EARLY PUNCH SAFEGUARDS (On 'arriver' only) [2]
+  // ------------------------------------------
+  if (action === 'arriver') {
+    if (activePunch) {
+      return res.status(400).json({ message: 'Vous êtes déjà arrivé ! Veuillez d abord cliquer sur "Départ en Pause" ou "Départ".' });
+    }
+
+    // Fetch this employee's published schedule for the current week [2]
+    const schedule = await WeeklySchedule.findOne({ employee: employee._id, weekStartDate: weekStartStr, status: 'published' });
+    if (!schedule) {
+      return res.status(400).json({ message: 'Aucun planning publié pour vous cette semaine. Impossible de pointer.' });
+    }
+
+    const daySchedule = schedule.days[dayName];
+    if (!daySchedule || daySchedule.isOff) {
+      return res.status(400).json({ message: 'Vous n êtes pas planifié aujourd hui (Repos).' });
+    }
+    if (daySchedule.isLeave) {
+      return res.status(400).json({ message: 'Vous êtes en congé payé aujourd hui.' });
+    }
+
+    // Check if they are trying to clock in more than 3 minutes before their shift starts [2]
+    const now = new Date();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+
+    // Find the closest upcoming shift start time [2]
+    let closestShiftStart = null;
+    let minDiff = Infinity;
+
+    daySchedule.shifts.forEach(shift => {
+      const shiftStartMinutes = getMinutesFromTimeStr(shift.startTime);
+      const diff = shiftStartMinutes - currentMinutes; // Minutes before shift starts
+
+      if (diff >= -120 && diff < minDiff) { // Allow clocking in if up to 2 hours late, but check early clock-ins
+        minDiff = diff;
+        closestShiftStart = shift.startTime;
+      }
+    });
+
+    // If the closest shift starts in more than 3 minutes, block them! [2]
+    if (minDiff > 3 && minDiff !== Infinity) {
+      const allowedTime = new Date(now.getTime() + (minDiff - 3) * 60000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      return res.status(400).json({ 
+        message: `Trop tôt ! Votre shift commence à ${closestShiftStart}. Vous pourrez pointer à partir de ${allowedTime}.` 
       });
     }
+  }
 
-    res.json({
-      employee: {
-        id: employee._id,
-        name: employee.name,
-        avatar: employee.avatar,
-      },
-      action,
-    });
-  }),
-);
+  // ------------------------------------------
+  // 🛑 4. CHECK FOUR-STEP WORKTIME LIFECYCLE LIMITS [2]
+  // ------------------------------------------
+  if (action === 'pause_start') {
+    if (!activePunch) return res.status(400).json({ message: 'Vous devez d abord pointer à l arrivée.' });
+    if (activePunch.breakStart) return res.status(400).json({ message: 'Vous êtes déjà en pause.' });
+  }
+
+  if (action === 'pause_end') {
+    if (!activePunch || !activePunch.breakStart) return res.status(400).json({ message: 'Aucun départ en pause enregistré.' });
+    if (activePunch.breakEnd) return res.status(400).json({ message: 'Vous êtes déjà revenu de pause.' });
+  }
+
+  if (action === 'depart') {
+    if (!activePunch) return res.status(400).json({ message: 'Aucun enregistrement d arrivée actif.' });
+    // If they started a break but never finished it, force them to close the break first [2]
+    if (activePunch.breakStart && !activePunch.breakEnd) {
+      return res.status(400).json({ message: 'Veuillez d abord enregistrer votre "Retour de Pause" avant de partir.' });
+    }
+  }
+
+  // Verification passed -> return identity [2]
+  res.json({
+    employee: {
+      id: employee._id,
+      name: employee.name,
+      avatar: employee.avatar
+    },
+    action
+  });
+}));
 
 // ==========================================
-// STEP 2: OFFICIALLY CONFIRM AND COMMIT PUNCH
+// STEP 2: OFFICIALLY CONFIRM AND COMMIT PUNCH [2]
 // ==========================================
-router.post(
-  "/confirm",
-  asyncHandler(async (req, res) => {
-    const { employeeId, action } = req.body;
+router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
+  const { employeeId, action } = req.body;
 
-    if (!employeeId || !action) {
-      return res
-        .status(400)
-        .json({ message: "Données de confirmation manquantes." });
-    }
+  if (!employeeId || !action) {
+    return res.status(400).json({ message: 'Données de confirmation manquantes.' });
+  }
 
-    const employee = await User.findById(employeeId);
-    if (!employee) {
-      return res.status(404).json({ message: "Employé introuvable." });
-    }
+  const employee = await User.findById(employeeId);
+  if (!employee) return res.status(404).json({ message: 'Employé introuvable.' });
 
-    const todayStr = getLocalDateString();
-    const activePunch = await Timeclock.findOne({
+  const todayStr = getLocalDateString();
+  const activePunch = await Timeclock.findOne({ employee: employeeId, checkOut: null });
+
+  // ------------------------------------------
+  // 1. ARRIVAL ('arriver')
+  // ------------------------------------------
+  if (action === 'arriver') {
+    if (activePunch) return res.status(400).json({ message: 'Déjà enregistré.' });
+
+    const newPunch = new Timeclock({
       employee: employeeId,
-      checkOut: null,
+      date: todayStr,
+      checkIn: new Date()
     });
+    await newPunch.save();
 
-    if (action === "arriver") {
-      if (activePunch)
-        return res.status(400).json({ message: "Déjà enregistré." });
+    req.app.get('io').emit('timeclock_updated');
 
-      const newPunch = new Timeclock({
-        employee: employeeId,
-        date: todayStr,
-        checkIn: new Date(),
-      });
-      await newPunch.save();
+    return res.json({
+      success: true,
+      action: 'arriver',
+      message: 'Bon service ! 👍',
+      employee: { name: employee.name, avatar: employee.avatar },
+      time: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+    });
+  }
 
-      req.app.get("io").emit("timeclock_updated");
+  // ------------------------------------------
+  // 2. START BREAK ('pause_start') [2]
+  // ------------------------------------------
+  if (action === 'pause_start') {
+    if (!activePunch || activePunch.breakStart) return res.status(400).json({ message: 'Action invalide.' });
 
-      return res.json({
-        success: true,
-        action: "arriver",
-        message: "Bon service ! 👍",
-        employee: { name: employee.name, avatar: employee.avatar },
-        time: new Date().toLocaleTimeString("fr-FR", {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-      });
-    } else if (action === "depart") {
-      if (!activePunch)
-        return res.status(400).json({ message: "Non enregistré." });
+    activePunch.breakStart = new Date();
+    await activePunch.save();
 
-      const checkOutTime = new Date();
-      const diffMs = checkOutTime - activePunch.checkIn;
-      const totalMinutes = Math.floor(diffMs / 60000);
+    return res.json({
+      success: true,
+      action: 'pause_start',
+      message: 'Bonne pause ! ☕',
+      employee: { name: employee.name, avatar: employee.avatar },
+      time: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+    });
+  }
 
-      activePunch.checkOut = checkOutTime;
-      activePunch.totalMinutes = totalMinutes;
-      await activePunch.save();
+  // ------------------------------------------
+  // 3. END BREAK ('pause_end') [2]
+  // ------------------------------------------
+  if (action === 'pause_end') {
+    if (!activePunch || !activePunch.breakStart || activePunch.breakEnd) return res.status(400).json({ message: 'Action invalide.' });
 
-      req.app.get("io").emit("timeclock_updated");
+    const endBreakTime = new Date();
+    const breakDiffMs = endBreakTime - activePunch.breakStart;
+    const actualBreakMinutes = Math.floor(breakDiffMs / 60000);
 
-      return res.json({
-        success: true,
-        action: "depart",
-        message: "Bonne soirée ! 👋",
-        employee: { name: employee.name, avatar: employee.avatar },
-        time: checkOutTime.toLocaleTimeString("fr-FR", {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-      });
-    }
-  }),
-);
+    activePunch.breakEnd = endBreakTime;
+    activePunch.actualBreakMinutes = actualBreakMinutes;
+    await activePunch.save();
+
+    return res.json({
+      success: true,
+      action: 'pause_end',
+      message: `Fin de pause ! Travail repris. (Durée: ${actualBreakMinutes} min)`,
+      employee: { name: employee.name, avatar: employee.avatar },
+      time: endBreakTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+    });
+  }
+
+  // ------------------------------------------
+  // 4. DEPARTURE ('depart') [2]
+  // ------------------------------------------
+  if (action === 'depart') {
+    if (!activePunch) return res.status(400).json({ message: 'Non enregistré.' });
+
+    const checkOutTime = new Date();
+    const diffMs = checkOutTime - activePunch.checkIn;
+    const elapsedMinutes = Math.floor(diffMs / 60000);
+
+    // 🛑 Subtract actual break minutes from total elapsed worked minutes [2]
+    const finalMinutesWorked = Math.max(0, elapsedMinutes - activePunch.actualBreakMinutes);
+
+    activePunch.checkOut = checkOutTime;
+    activePunch.totalMinutes = finalMinutesWorked;
+    await activePunch.save();
+
+    req.app.get('io').emit('timeclock_updated'); // Update Admin dynamic dashboards [2]
+
+    return res.json({
+      success: true,
+      action: 'depart',
+      message: 'Bonne soirée ! 👋',
+      employee: { name: employee.name, avatar: employee.avatar },
+      time: checkOutTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+    });
+  }
+}));
+
 
 // ==========================================
 // . MANUALLY CREATE A TIMESHEET (With Break Subtraction) [2]
