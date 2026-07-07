@@ -98,6 +98,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/timeclock', timeclockRoutes);
 app.use('/api/leaves', leaveRoutes);
 app.use('/api/swaps', require('./routes/swapRoutes')); 
+app.use('/api/settings', require('./routes/settingsRoutes'));
 /* =========================
    SOCKET EVENTS
 ========================= */

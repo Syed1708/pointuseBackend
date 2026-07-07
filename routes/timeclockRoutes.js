@@ -7,6 +7,7 @@ const { authenticateToken, requirePermission } = require("../middleware/auth");
 const asyncHandler = require("../helpers/asyncHandler");
 const WeeklySchedule = require("../models/WeeklySchedule");
 const Role = require("../models/Role");
+const Settings = require("../models/Settings");
 const { pinVerifyLimiter } = require('../middleware/rateLimiter');
 const { getDistanceInMeters } = require("../utils/geoHelper");
 
@@ -360,18 +361,32 @@ router.post('/verify', asyncHandler(async (req, res) => {
   // 🛑 2. GEOFENCING CHECK: Verify exact work location proximity [2]
   // We check if coordinates are passed (always sent by phones, optional for locked terminal tablet)
   if (latitude && longitude) {
-    const targetLat = parseFloat(process.env.RESTAURANT_LAT);
-    const targetLon = parseFloat(process.env.RESTAURANT_LON);
-    const maxRadius = parseFloat(process.env.ALLOWED_RADIUS_METERS || 100);
+    const settings = await Settings.findOne({ key: 'restaurant_config' });
+    const targetLat = settings?.latitude;
+    const targetLon = settings?.longitude;
+    const maxRadius = settings?.allowedRadiusMeters || 100;
 
-    const distance = getDistanceInMeters(latitude, longitude, targetLat, targetLon);
+    // 🛑 If coordinates are blank/null in database, safely bypass geofencing completely! [2]
+    if (targetLat !== null && targetLon !== null && !isNaN(targetLat) && !isNaN(targetLon)) {
+      const distance = getDistanceInMeters(latitude, longitude, targetLat, targetLon);
 
-    if (distance > maxRadius) {
-      return res.status(403).json({ 
-        message: `Accès refusé : Vous devez être présent sur le lieu de travail pour pointer. (Distance actuelle: ${Math.round(distance)}m)` 
-      });
+      console.log(`📍 Live Database Geofence Check:
+        - Employee: [${latitude}, ${longitude}]
+        - Restaurant: [${targetLat}, ${targetLon}]
+        - Calculated Distance: ${Math.round(distance)}m
+        - Allowed Radius: ${maxRadius}m
+      `);
+
+      if (distance > maxRadius) {
+        return res.status(403).json({ 
+          message: `Accès refusé : Vous devez être présent sur le lieu de travail pour pointer. (Distance actuelle: ${Math.round(distance)}m)` 
+        });
+      }
+    } else {
+      console.log("📍 Geofencing bypassed because restaurant coordinates are set to blank in database.");
     }
   }
+
 
   const todayStr = getLocalDateString();
   const dayName = getWeekdayKey(todayStr); // e.g. "monday"
