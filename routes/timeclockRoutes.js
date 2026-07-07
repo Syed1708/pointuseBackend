@@ -402,10 +402,17 @@ router.post('/verify', asyncHandler(async (req, res) => {
     }
 
     // Check if they are trying to clock in more than 3 minutes before their shift starts [2]
-    const now = new Date();
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+ 
+    // 🛑 1. TIMEZONE-IMMUNE CURRENT TIME: Force calculation in Europe/Paris timezone [1.1.4]
+    const timeStrInFrance = new Date().toLocaleTimeString('fr-FR', {
+      timeZone: 'Europe/Paris',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+    const [localH, localM] = timeStrInFrance.split(':').map(Number);
+    const currentMinutes = localH * 60 + localM; // Current minutes past midnight in France
 
-    // Find the closest upcoming shift start time [2]
     let closestShiftStart = null;
     let minDiff = Infinity;
 
@@ -419,13 +426,22 @@ router.post('/verify', asyncHandler(async (req, res) => {
       }
     });
 
-    // If the closest shift starts in more than 3 minutes, block them! [2]
+    // If the closest shift starts in more than 3 minutes, block them!
     if (minDiff > 3 && minDiff !== Infinity) {
-      const allowedTime = new Date(now.getTime() + (minDiff - 3) * 60000).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+      // 🛑 2. TIMEZONE-IMMUNE ALLOWED TIME CALCULATION: Pure integer math
+      // Subtract 3 minutes from the shift start minutes and format directly (e.g. 180 - 3 = 177 mins = 02:57)
+      const shiftStartMinutes = getMinutesFromTimeStr(closestShiftStart);
+      const allowedMinutes = shiftStartMinutes - 3;
+      const allowedH = Math.floor(allowedMinutes / 60);
+      const allowedM = allowedMinutes % 60;
+      const allowedTime = `${String(allowedH).padStart(2, '0')}:${String(allowedM).padStart(2, '0')}`;
+
       return res.status(400).json({ 
         message: `Trop tôt ! Votre shift commence à ${closestShiftStart}. Vous pourrez pointer à partir de ${allowedTime}.` 
       });
     }
+
+
   }
 
   // ------------------------------------------
