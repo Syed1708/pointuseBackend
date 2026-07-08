@@ -7,6 +7,7 @@ const Notification = require('../models/Notification');
 const { authenticateToken, requirePermission } = require('../middleware/auth');
 const asyncHandler = require('../helpers/asyncHandler');
 const { getMonday, getWeekdayKey } = require('../utils/dateHelper');
+const { default: mongoose } = require('mongoose');
 
 
 
@@ -101,9 +102,12 @@ router.get('/admin/list', authenticateToken, requirePermission('employees:view')
   res.json(requests);
 }));
 
-// ==========================================
-// 4. APPROVE / REJECT LEAVE REQUEST (With Auto-Fill Schedule) [1, 2]
-// ==========================================
+
+
+
+// =========================================================================
+// 4. APPROVE / REJECT LEAVE REQUEST (With Transactional Auto-Fill) [1, 2]
+// =========================================================================
 router.put('/admin/:id/status', authenticateToken, requirePermission('employees:edit'), asyncHandler(async (req, res) => {
   const { status } = req.body; // 'approved' or 'rejected'
   
@@ -114,28 +118,53 @@ router.put('/admin/:id/status', authenticateToken, requirePermission('employees:
     return res.status(400).json({ message: 'Cette demande a déjà été traitée.' });
   }
 
-  request.status = status;
-  request.approvedBy = req.user.id;
-  await request.save();
-
   const userSockets = req.app.get('userSockets');
   const io = req.app.get('io');
 
-  // ------------------------------------------
-  // 🛑 SPECIAL CASE: AUTO-FILL CALENDAR ON APPROVAL [2]
-  // ------------------------------------------
-  if (status === 'approved') {
+  // If rejected, simply update the request status (no schedule edits needed)
+  if (status === 'rejected') {
+    request.status = 'rejected';
+    request.approvedBy = req.user.id;
+    await request.save();
+
+    const notification = new Notification({
+      recipient: request.employee,
+      title: '❌ Leave Request Rejected',
+      message: `Your leave request for ${request.startDate} to ${request.endDate} has been rejected.`
+    });
+    await notification.save();
+
+    const recipientSocketId = userSockets.get(request.employee.toString());
+    if (recipientSocketId) {
+      io.to(recipientSocketId).emit('notification_received', notification);
+    }
+
+    return res.json({ message: 'Demande rejetée.', request });
+  }
+
+  // -------------------------------------------------------------------------
+  // 🛑 START TRANSACTION SESSION FOR APPROVAL (Auto-fills multiple weeks safely) [2]
+  // -------------------------------------------------------------------------
+  const session = await mongoose.startSession();
+  session.startTransaction(); // Opens the transactional session lock [2]
+
+  try {
+    // 1. Update request status inside the session [2]
+    request.status = 'approved';
+    request.approvedBy = req.user.id;
+    await request.save({ session });
+
     const start = new Date(`${request.startDate}T00:00:00`);
     const end = new Date(`${request.endDate}T00:00:00`);
 
     let current = new Date(start);
     while (current <= end) {
-      const currentDateStr = current.toLocaleDateString('fr-CA'); // YYYY-MM-DD [3]
+      const currentDateStr = current.toLocaleDateString('fr-CA'); // "YYYY-MM-DD"
       const weekStartDate = getMonday(currentDateStr);
-      const dayName = getWeekdayKey(currentDateStr); // e.g. "monday"
+      const dayName = getWeekdayKey(currentDateStr);
 
-      // Find or create the WeeklySchedule document [2]
-      let schedule = await WeeklySchedule.findOne({ employee: request.employee, weekStartDate });
+      // Find or create the WeeklySchedule document inside the session [2]
+      let schedule = await WeeklySchedule.findOne({ employee: request.employee, weekStartDate }).session(session);
       if (!schedule) {
         schedule = new WeeklySchedule({
           employee: request.employee,
@@ -148,7 +177,7 @@ router.put('/admin/:id/status', authenticateToken, requirePermission('employees:
         });
       }
 
-      // Mark the day as Leave/Congé in Mongoose
+      // Mark the specific day as Leave/Congé
       schedule.days[dayName] = {
         isOff: false,
         isLeave: true,
@@ -156,32 +185,42 @@ router.put('/admin/:id/status', authenticateToken, requirePermission('employees:
         shifts: []
       };
 
-      // Recalculate total hours and save
+      // Recalculate total hours and save inside the session [2]
       schedule.totalHours = calculateWeeklyHours(schedule.days);
-      await schedule.save();
+      await schedule.save({ session });
 
       current.setDate(current.getDate() + 1); // Move to next day
     }
 
-    // Emit live schedule refresh to planning active boards
+    // 2. Create the notification inside the session [2]
+    const notification = new Notification({
+      recipient: request.employee,
+      title: '✅ Leave Approved!',
+      message: `Your leave request for ${request.startDate} to ${request.endDate} has been approved.`
+    });
+    await notification.save({ session });
+
+    // 🏆 3. COMMIT ALL CHANGES SIMULTANEOUSLY [2]
+    await session.commitTransaction(); 
+    session.endSession(); // Close session safely
+
+    // Emit live schedule refresh to planning boards now that transaction succeeded
     io.emit('schedule_updated');
+
+    const recipientSocketId = userSockets.get(request.employee.toString());
+    if (recipientSocketId) {
+      const latestNotif = await Notification.findOne({ recipient: request.employee }).sort({ createdAt: -1 });
+      io.to(recipientSocketId).emit('notification_received', latestNotif);
+    }
+
+    res.json({ message: 'Demande approuvée et calendriers mis à jour.', request });
+
+  } catch (error) {
+    // 🛑 4. ROLLBACK ON FAILURE: Undoes any written days and clears status updates [2]
+    await session.abortTransaction(); 
+    session.endSession();
+    throw new Error(error.message); // Passed to central handler [2]
   }
-
-  // Notify the employee who made the request [2]
-  const employeeNotification = new Notification({
-    recipient: request.employee,
-    title: status === 'approved' ? '✅ Leave Approved!' : '❌ Leave Rejected',
-    message: `Your leave request for ${request.startDate} to ${request.endDate} has been ${status}.`,
-    link: '/dashboard/planning'
-  });
-  await employeeNotification.save();
-
-  const recipientSocketId = userSockets.get(request.employee.toString());
-  if (recipientSocketId) {
-    io.to(recipientSocketId).emit('notification_received', employeeNotification);
-  }
-
-  res.json({ message: `Demande mise à jour: ${status}`, request });
 }));
 
 module.exports = router;

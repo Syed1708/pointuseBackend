@@ -2,47 +2,19 @@ const express = require("express");
 const router = express.Router();
 const User = require("../models/User");
 const Timeclock = require("../models/Timeclock");
-const { decrypt } = require("../helpers/cryptoHelper");
-const { authenticateToken, requirePermission } = require("../middleware/auth");
-const asyncHandler = require("../helpers/asyncHandler");
 const WeeklySchedule = require("../models/WeeklySchedule");
 const Role = require("../models/Role");
 const Settings = require("../models/Settings");
-const { pinVerifyLimiter } = require('../middleware/rateLimiter');
+const mongoose = require("mongoose"); // 🛑 Import mongoose for transaction sessions [2]
+
+const { authenticateToken, requirePermission } = require("../middleware/auth");
+const { decrypt } = require("../helpers/cryptoHelper");
 const { getDistanceInMeters } = require("../utils/geoHelper");
+const { pinVerifyLimiter } = require('../middleware/rateLimiter');
+const asyncHandler = require("../helpers/asyncHandler"); // 🛑 Centralized async wrapper [2]
 
-// Helper: Get YYYY-MM-DD in local timezone safely
-const getLocalDateString = () => {
-  return new Date().toLocaleDateString("fr-CA");
-};
-
-// Helper: Find Monday of any YYYY-MM-DD string
-const getMonday = (dateStr) => {
-  const date = new Date(dateStr + "T00:00:00");
-  const day = date.getDay();
-  const diff = date.getDate() - day + (day === 0 ? -6 : 1);
-  const targetDate = new Date(date.setDate(diff));
-  const year = targetDate.getFullYear();
-  const month = String(targetDate.getMonth() + 1).padStart(2, "0");
-  const dayStr = String(targetDate.getDate()).padStart(2, "0");
-  return `${year}-${month}-${dayStr}`;
-};
-
-// Helper: Get weekday name from any YYYY-MM-DD string
-const getWeekdayKey = (dateStr) => {
-  const date = new Date(dateStr + "T00:00:00");
-  const weekdays = [
-    "sunday",
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-  ];
-  return weekdays[date.getDay()];
-};
-
+// 🛑 Centralized Date Helpers (Duplicate local helpers deleted) [3]
+const { getMonday, getWeekdayKey, getLocalDateString } = require("../utils/dateHelper");
 
 // Helper: Convert "10:00" to minutes past midnight
 const getMinutesFromTimeStr = (timeStr) => {
@@ -50,303 +22,19 @@ const getMinutesFromTimeStr = (timeStr) => {
   return h * 60 + m;
 };
 
-// ==========================================
-// 1. GET ALL TIMESHEETS (With On-the-Fly Schedule Comparisons) [2, 3]
-// ==========================================
-router.get(
-  "/admin/list",
-  authenticateToken,
-  requirePermission("pointage:view"),
-  asyncHandler(async (req, res) => {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 2;
-    const search = req.query.search || "";
-    const filterApproved = req.query.filter || ""; // 'true' or 'false'
+// =========================================================================
+// 🛑 POINTEUSE PUBLIC ENDPOINTS (Placed first for fast routing)
+// =========================================================================
 
-    let query = {};
-
-    // If search query is provided, find matching employee IDs first [2]
-    if (search) {
-      const matchingEmployees = await User.find({
-        name: { $regex: search, $options: "i" },
-      }).select("_id");
-      query.employee = { $in: matchingEmployees.map((e) => e._id) };
-    }
-
-    // Filter by approval status
-    if (filterApproved) {
-      query.isApproved = filterApproved === "true";
-    }
-
-    const totalDocs = await Timeclock.countDocuments(query);
-    const totalPages = Math.ceil(totalDocs / limit);
-    const skip = (page - 1) * limit;
-
-    // Fetch timesheets
-    const timesheets = await Timeclock.find(query)
-      .populate("employee", "name avatar contractHours")
-      .populate("approvedBy", "name")
-      .sort({ date: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-
-    // 🛑 DYNAMICALLY LOOKUP AND MERGE PLANNED SHIFT FOR EACH TIMESHEET [2]
-    const enrichedTimesheets = [];
-    for (const ts of timesheets) {
-      const tsObj = ts.toObject();
-
-      // 1. Calculate the Monday and Day Key of this timesheet's date
-      const weekStartStr = getMonday(ts.date);
-      const dayName = getWeekdayKey(ts.date);
-
-      // 2. Fetch the matching weekly schedule for this employee
-      const schedule = await WeeklySchedule.findOne({
-        employee: ts.employee._id,
-        weekStartDate: weekStartStr,
-      });
-
-      let plannedShiftText = "No Plan"; // Default fallback
-
-      // 3. Extract the planned shift configuration for this day
-      if (schedule) {
-        const dayData = schedule.days[dayName];
-        if (dayData) {
-          if (dayData.isOff) {
-            plannedShiftText = "Repos";
-          } else if (dayData.isLeave) {
-            plannedShiftText = `Congé (${dayData.leaveHours}h)`;
-          } else if (dayData.shifts && dayData.shifts.length > 0) {
-            plannedShiftText = dayData.shifts
-              .map((s) => `${s.startTime}-${s.endTime}`)
-              .join(" / ");
-          }
-        }
-      }
-
-      tsObj.plannedShiftText = plannedShiftText; // Attach the planned shift text [2]
-      enrichedTimesheets.push(tsObj);
-    }
-
-    res.json({
-      docs: enrichedTimesheets,
-      totalPages,
-      totalDocs,
-      page,
-    });
-  }),
-);
-
-// ==========================================
-// 5. GET WEEKLY SUMMARY FOR ALL EMPLOYEES (Admins & Managers) [2]
-// ==========================================
-router.get(
-  "/admin/weekly-summary",
-  authenticateToken,
-  requirePermission("pointage:view"),
-  asyncHandler(async (req, res) => {
-    const { weekStartDate } = req.query; // Expects "YYYY-MM-DD" representing a Monday
-    if (!weekStartDate)
-      return res
-        .status(400)
-        .json({ message: "weekStartDate parameter is required." });
-
-    const employeeRole = await Role.findOne({ name: "employee" });
-    const employees = await User.find({ role: employeeRole._id }).select(
-      "name email contractHours avatar",
-    );
-
-    // Calculate the 7 dates of this week [3]
-    const dates = [];
-    const startDate = new Date(weekStartDate);
-    for (let i = 0; i < 7; i++) {
-      const d = new Date(startDate);
-      d.setDate(startDate.getDate() + i);
-      dates.push(d.toLocaleDateString("fr-CA")); // Formats safely to YYYY-MM-DD [3]
-    }
-
-    const summaries = [];
-    for (const emp of employees) {
-      // Fetch all timesheets for this employee during this week's 7 dates
-      const punches = await Timeclock.find({
-        employee: emp._id,
-        date: { $in: dates },
-      });
-
-      let totalMinutes = 0;
-      let pendingCount = 0;
-      let completedCount = 0;
-
-      punches.forEach((p) => {
-        if (p.checkOut) {
-          totalMinutes += p.totalMinutes || 0;
-          completedCount++;
-          if (!p.isApproved) pendingCount++;
-        } else {
-          // Active/Running session: calculate running minutes [2]
-          const diffMs = new Date() - new Date(p.checkIn);
-          totalMinutes += Math.max(0, Math.floor(diffMs / 60000));
-          pendingCount++;
-        }
-      });
-
-      const actualHours = parseFloat((totalMinutes / 60).toFixed(2));
-      const contractHours = emp.contractHours || 35;
-      const extraHours =
-        actualHours > contractHours
-          ? parseFloat((actualHours - contractHours).toFixed(2))
-          : 0;
-
-      // A week is fully approved if there are completed records and zero pending approvals left [2]
-      const isFullyApproved = completedCount > 0 && pendingCount === 0;
-
-      summaries.push({
-        employee: emp,
-        contractHours,
-        actualHours,
-        extraHours,
-        isFullyApproved,
-        pendingCount,
-        completedCount,
-      });
-    }
-
-    res.json(summaries);
-  }),
-);
-
-// ==========================================
-// 3. APPROVE / LOCK A TIMESHEET [2]
-// ==========================================
-router.put(
-  "/admin/:id/approve",
-  authenticateToken,
-  requirePermission("employees:edit"),
-  asyncHandler(async (req, res) => {
-    const timesheet = await Timeclock.findById(req.params.id);
-    if (!timesheet)
-      return res.status(404).json({ message: "Fiche de temps introuvable." });
-
-    if (!timesheet.checkOut) {
-      return res
-        .status(400)
-        .json({ message: "Impossible d approuver une session encore active." });
-    }
-
-    timesheet.isApproved = true;
-    timesheet.approvedBy = req.user.id; // Record who approved this [2]
-    await timesheet.save();
-
-    // Trigger real-time dashboard updates [2]
-    req.app.get("io").emit("timeclock_updated");
-
-    res.json({ message: "Fiche approuvée et verrouillée.", timesheet });
-  }),
-);
-
-// ==========================================
-// PUNCH CLOCK-IN / OUT (Pointeuse Logic remains the same)
-// ==========================================
-router.post(
-  "/punch",
-  asyncHandler(async (req, res) => {
-    const { pinCode, action } = req.body;
-
-    if (!pinCode || !action) {
-      return res
-        .status(400)
-        .json({ message: "Le code PIN et l action sont requis." });
-    }
-
-    const users = await User.find({ pinCode: { $ne: null } }).populate("role");
-    const employee = users.find((u) => decrypt(u.pinCode) === pinCode);
-
-    if (!employee) {
-      return res
-        .status(400)
-        .json({ message: "Code PIN incorrect. Veuillez réessayer." });
-    }
-
-    if (employee.role.name !== "employee") {
-      return res
-        .status(403)
-        .json({ message: "Seuls les employés peuvent utiliser la pointeuse." });
-    }
-
-    const todayStr = getLocalDateString();
-    const activePunch = await Timeclock.findOne({
-      employee: employee._id,
-      checkOut: null,
-    });
-
-    if (action === "arriver") {
-      if (activePunch) {
-        return res.status(400).json({
-          message: `Vous êtes déjà arrivé ! Veuillez cliquer sur "Départ" pour terminer votre travail.`,
-        });
-      }
-
-      const newPunch = new Timeclock({
-        employee: employee._id,
-        date: todayStr,
-        checkIn: new Date(),
-      });
-      await newPunch.save();
-
-      req.app.get("io").emit("timeclock_updated");
-
-      return res.json({
-        success: true,
-        action: "arriver",
-        message: "Bon service ! 👍",
-        employee: { name: employee.name, avatar: employee.avatar },
-        time: new Date().toLocaleTimeString("fr-FR", {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-      });
-    } else if (action === "depart") {
-      if (!activePunch) {
-        return res.status(400).json({
-          message: `Vous n'êtes pas encore arrivé ! Veuillez d'abord cliquer sur "Arriver".`,
-        });
-      }
-
-      const checkOutTime = new Date();
-      const diffMs = checkOutTime - activePunch.checkIn;
-      const totalMinutes = Math.floor(diffMs / 60000);
-
-      activePunch.checkOut = checkOutTime;
-      activePunch.totalMinutes = totalMinutes;
-      await activePunch.save();
-
-      req.app.get("io").emit("timeclock_updated");
-
-      return res.json({
-        success: true,
-        action: "depart",
-        message: "Bonne soirée ! 👋",
-        employee: { name: employee.name, avatar: employee.avatar },
-        time: checkOutTime.toLocaleTimeString("fr-FR", {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-      });
-    }
-  }),
-);
-
-
-// ==========================================
-// 1. STEP 1: VERIFY PIN, GPS, AND SCHEDULE ALIGNMENT [2]
-// ==========================================
-router.post('/verify', asyncHandler(async (req, res) => {
+// 1. STEP 1: VERIFY PIN, GPS, AND SCHEDULE ALIGNMENT (With Geofencing & early safeguards) [2]
+router.post('/verify', pinVerifyLimiter, asyncHandler(async (req, res) => {
   const { pinCode, action, latitude, longitude } = req.body; // coordinates passed from client
 
   if (!pinCode || !action) {
     return res.status(400).json({ message: 'Le code PIN et l action sont requis.' });
   }
 
-  // 1. Locate the employee by decrypting their stored PIN on the fly
+  // Locate the employee by decrypting their stored PIN on the fly
   const users = await User.find({ pinCode: { $ne: null } }).populate('role');
   const employee = users.find(u => decrypt(u.pinCode) === pinCode);
 
@@ -358,15 +46,14 @@ router.post('/verify', asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Seuls les employés peuvent utiliser la pointeuse.' });
   }
 
-  // 🛑 2. GEOFENCING CHECK: Verify exact work location proximity [2]
-  // We check if coordinates are passed (always sent by phones, optional for locked terminal tablet)
+  // 🛑 GEOFENCING CHECK: Dynamic database settings lookup [2]
   if (latitude && longitude) {
     const settings = await Settings.findOne({ key: 'restaurant_config' });
     const targetLat = settings?.latitude;
     const targetLon = settings?.longitude;
     const maxRadius = settings?.allowedRadiusMeters || 100;
 
-    // 🛑 If coordinates are blank/null in database, safely bypass geofencing completely! [2]
+    // If coordinates are blank/null in database, safely bypass geofencing completely! [2]
     if (targetLat !== null && targetLon !== null && !isNaN(targetLat) && !isNaN(targetLon)) {
       const distance = getDistanceInMeters(latitude, longitude, targetLat, targetLon);
 
@@ -387,7 +74,6 @@ router.post('/verify', asyncHandler(async (req, res) => {
     }
   }
 
-
   const todayStr = getLocalDateString();
   const dayName = getWeekdayKey(todayStr); // e.g. "monday"
   const weekStartStr = getMonday(todayStr);
@@ -395,7 +81,7 @@ router.post('/verify', asyncHandler(async (req, res) => {
   const activePunch = await Timeclock.findOne({ employee: employee._id, checkOut: null });
 
   // ------------------------------------------
-  // 🛑 3. SCHEDULE-ALIGNED EARLY PUNCH SAFEGUARDS (On 'arriver' only) [2]
+  // SCHEDULE-ALIGNED EARLY PUNCH SAFEGUARDS (On 'arriver' only) [2]
   // ------------------------------------------
   if (action === 'arriver') {
     if (activePunch) {
@@ -416,9 +102,7 @@ router.post('/verify', asyncHandler(async (req, res) => {
       return res.status(400).json({ message: 'Vous êtes en congé payé aujourd hui.' });
     }
 
-    // Check if they are trying to clock in more than 3 minutes before their shift starts [2]
- 
-    // 🛑 1. TIMEZONE-IMMUNE CURRENT TIME: Force calculation in Europe/Paris timezone [1.1.4]
+    // Timezone-immune current time calculation (Forced to France Europe/Paris timezone)
     const timeStrInFrance = new Date().toLocaleTimeString('fr-FR', {
       timeZone: 'Europe/Paris',
       hour: '2-digit',
@@ -435,16 +119,15 @@ router.post('/verify', asyncHandler(async (req, res) => {
       const shiftStartMinutes = getMinutesFromTimeStr(shift.startTime);
       const diff = shiftStartMinutes - currentMinutes; // Minutes before shift starts
 
-      if (diff >= -120 && diff < minDiff) { // Allow clocking in if up to 2 hours late, but check early clock-ins
+      // Allow clocking in if they are up to 2 hours late (diff >= -120), but check early clock-ins
+      if (diff >= -120 && diff < minDiff) {
         minDiff = diff;
         closestShiftStart = shift.startTime;
       }
     });
 
-    // If the closest shift starts in more than 3 minutes, block them!
+    // If the closest shift starts in more than 3 minutes, block them! [2]
     if (minDiff > 3 && minDiff !== Infinity) {
-      // 🛑 2. TIMEZONE-IMMUNE ALLOWED TIME CALCULATION: Pure integer math
-      // Subtract 3 minutes from the shift start minutes and format directly (e.g. 180 - 3 = 177 mins = 02:57)
       const shiftStartMinutes = getMinutesFromTimeStr(closestShiftStart);
       const allowedMinutes = shiftStartMinutes - 3;
       const allowedH = Math.floor(allowedMinutes / 60);
@@ -455,12 +138,10 @@ router.post('/verify', asyncHandler(async (req, res) => {
         message: `Trop tôt ! Votre shift commence à ${closestShiftStart}. Vous pourrez pointer à partir de ${allowedTime}.` 
       });
     }
-
-
   }
 
   // ------------------------------------------
-  // 🛑 4. CHECK FOUR-STEP WORKTIME LIFECYCLE LIMITS [2]
+  // CHECK FOUR-STEP WORKTIME LIFECYCLE LIMITS [2]
   // ------------------------------------------
   if (action === 'pause_start') {
     if (!activePunch) return res.status(400).json({ message: 'Vous devez d abord pointer à l arrivée.' });
@@ -491,9 +172,7 @@ router.post('/verify', asyncHandler(async (req, res) => {
   });
 }));
 
-// ==========================================
-// STEP 2: OFFICIALLY CONFIRM AND COMMIT PUNCH [2]
-// ==========================================
+// 2. STEP 2: CONFIRM AND COMMIT PUNCH [2]
 router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
   const { employeeId, action } = req.body;
 
@@ -507,9 +186,7 @@ router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
   const todayStr = getLocalDateString();
   const activePunch = await Timeclock.findOne({ employee: employeeId, checkOut: null });
 
-  // ------------------------------------------
-  // 1. ARRIVAL ('arriver')
-  // ------------------------------------------
+  // Arrival ('arriver')
   if (action === 'arriver') {
     if (activePunch) return res.status(400).json({ message: 'Déjà enregistré.' });
 
@@ -531,9 +208,7 @@ router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
     });
   }
 
-  // ------------------------------------------
-  // 2. START BREAK ('pause_start') [2]
-  // ------------------------------------------
+  // Start Break ('pause_start') [2]
   if (action === 'pause_start') {
     if (!activePunch || activePunch.breakStart) return res.status(400).json({ message: 'Action invalide.' });
 
@@ -549,9 +224,7 @@ router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
     });
   }
 
-  // ------------------------------------------
-  // 3. END BREAK ('pause_end') [2]
-  // ------------------------------------------
+  // End Break ('pause_end') [2]
   if (action === 'pause_end') {
     if (!activePunch || !activePunch.breakStart || activePunch.breakEnd) return res.status(400).json({ message: 'Action invalide.' });
 
@@ -559,8 +232,9 @@ router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
     const breakDiffMs = endBreakTime - activePunch.breakStart;
     const actualBreakMinutes = Math.floor(breakDiffMs / 60000);
 
+    activePunch.checkOut = null; // Remains active until main checkout
     activePunch.breakEnd = endBreakTime;
-    activePunch.actualBreakMinutes = actualBreakMinutes;
+    activePunch.actualBreakMinutes = (activePunch.actualBreakMinutes || 0) + actualBreakMinutes;
     await activePunch.save();
 
     return res.json({
@@ -572,9 +246,7 @@ router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
     });
   }
 
-  // ------------------------------------------
-  // 4. DEPARTURE ('depart') [2]
-  // ------------------------------------------
+  // Departure ('depart') [2]
   if (action === 'depart') {
     if (!activePunch) return res.status(400).json({ message: 'Non enregistré.' });
 
@@ -582,14 +254,14 @@ router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
     const diffMs = checkOutTime - activePunch.checkIn;
     const elapsedMinutes = Math.floor(diffMs / 60000);
 
-    // 🛑 Subtract actual break minutes from total elapsed worked minutes [2]
-    const finalMinutesWorked = Math.max(0, elapsedMinutes - activePunch.actualBreakMinutes);
+    // Subtract actual break minutes from total elapsed worked minutes [2]
+    const finalMinutesWorked = Math.max(0, elapsedMinutes - (activePunch.actualBreakMinutes || 0));
 
     activePunch.checkOut = checkOutTime;
     activePunch.totalMinutes = finalMinutesWorked;
     await activePunch.save();
 
-    req.app.get('io').emit('timeclock_updated'); // Update Admin dynamic dashboards [2]
+    req.app.get('io').emit('timeclock_updated'); // Update Admin dashboards in real-time [2, 3]
 
     return res.json({
       success: true,
@@ -601,69 +273,290 @@ router.post('/confirm', authenticateToken, asyncHandler(async (req, res) => {
   }
 }));
 
+// 3. PUNCH FALLBACK (Kept for backwards compatibility)
+router.post('/punch', asyncHandler(async (req, res) => {
+  const { pinCode, action } = req.body;
+  if (!pinCode || !action) return res.status(400).json({ message: 'Code PIN et action requis.' });
 
-// ==========================================
-// . MANUALLY CREATE A TIMESHEET (With Break Subtraction) [2]
-// ==========================================
-router.post(
-  "/admin/create",
-  authenticateToken,
-  requirePermission("employees:edit"),
-  asyncHandler(async (req, res) => {
-    const {
-      employeeId,
-      date,
-      checkInTime,
-      checkOutTime,
-      breakMinutes,
-      shiftType,
-    } = req.body;
+  const users = await User.find({ pinCode: { $ne: null } }).populate('role');
+  const employee = users.find((u) => decrypt(u.pinCode) === pinCode);
 
-    if (!employeeId || !date || !shiftType) {
-      return res
-        .status(400)
-        .json({
-          message: "L employé, la date et le type de shift sont requis.",
-        });
+  if (!employee) return res.status(400).json({ message: 'Code PIN incorrect.' });
+  if (employee.role.name !== 'employee') return res.status(403).json({ message: 'Accès refusé.' });
+
+  const todayStr = getLocalDateString();
+  const activePunch = await Timeclock.findOne({ employee: employee._id, checkOut: null });
+
+  if (action === 'arriver') {
+    if (activePunch) return res.status(400).json({ message: 'Déjà enregistré.' });
+    const newPunch = new Timeclock({ employee: employee._id, date: todayStr, checkIn: new Date() });
+    await newPunch.save();
+    req.app.get('io').emit('timeclock_updated');
+    return res.json({ success: true, action: 'arriver', employee: { name: employee.name } });
+  } else if (action === 'depart') {
+    if (!activePunch) return res.status(400).json({ message: 'Non enregistré.' });
+    const checkOutTime = new Date();
+    activePunch.checkOut = checkOutTime;
+    activePunch.totalMinutes = Math.floor((checkOutTime - activePunch.checkIn) / 60000);
+    await activePunch.save();
+    req.app.get('io').emit('timeclock_updated');
+    return res.json({ success: true, action: 'depart', employee: { name: employee.name } });
+  }
+}));
+
+// =========================================================================
+// 🛑 ADMIN STATIC ROUTES (Placed above wildcard ID endpoints) [1]
+// =========================================================================
+
+// 4. GET ALL TIMESHEETS (Admins & Managers) [3]
+router.get('/admin/list', authenticateToken, requirePermission('pointage:view'), asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const search = req.query.search || '';
+  const filterApproved = req.query.filter || ''; 
+
+  let query = {};
+  if (search) {
+    const matchingEmployees = await User.find({ name: { $regex: search, $options: 'i' } }).select('_id');
+    query.employee = { $in: matchingEmployees.map(e => e._id) };
+  }
+
+  if (filterApproved) {
+    query.isApproved = filterApproved === 'true';
+  }
+
+  const totalDocs = await Timeclock.countDocuments(query);
+  const totalPages = Math.ceil(totalDocs / limit);
+  const skip = (page - 1) * limit;
+
+  const timesheets = await Timeclock.find(query)
+    .populate('employee', 'name avatar contractHours')
+    .populate('approvedBy', 'name')
+    .sort({ date: -1, createdAt: -1 })
+    .skip(skip)
+    .limit(limit);
+
+  const enrichedTimesheets = [];
+  for (const ts of timesheets) {
+    const tsObj = ts.toObject();
+    const weekStartStr = getMonday(ts.date);
+    const dayName = getWeekdayKey(ts.date);
+
+    const schedule = await WeeklySchedule.findOne({ employee: ts.employee._id, weekStartDate: weekStartStr });
+    let plannedShiftText = 'No Plan';
+
+    if (schedule) {
+      const dayData = schedule.days[dayName];
+      if (dayData) {
+        if (dayData.isOff) plannedShiftText = 'Repos';
+        else if (dayData.isLeave) plannedShiftText = `Congé (${dayData.leaveHours}h)`;
+        else if (dayData.shifts && dayData.shifts.length > 0) {
+          plannedShiftText = dayData.shifts.map(s => `${s.startTime}-${s.endTime}`).join(' / ');
+        }
+      }
+    }
+    tsObj.plannedShiftText = plannedShiftText;
+    enrichedTimesheets.push(tsObj);
+  }
+
+  res.json({ docs: enrichedTimesheets, totalPages, totalDocs, page });
+}));
+
+// 5. GET WEEKLY SUMMARY REPORT FOR ALL EMPLOYEES (Admins & Managers) [2]
+router.get('/admin/weekly-summary', authenticateToken, requirePermission('pointage:view'), asyncHandler(async (req, res) => {
+  const { weekStartDate } = req.query; 
+  if (!weekStartDate) return res.status(400).json({ message: 'weekStartDate parameter is required.' });
+
+  const employeeRole = await Role.findOne({ name: 'employee' });
+  const employees = await User.find({ role: employeeRole._id }).select('name email contractHours avatar');
+
+  const dates = [];
+  const startDate = new Date(weekStartDate.replace(/-/g, '/')); // Force slash parsing [1.1.4]
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(startDate);
+    d.setDate(startDate.getDate() + i);
+    dates.push(d.toLocaleDateString('fr-CA')); 
+  }
+
+  const summaries = [];
+  for (const emp of employees) {
+    const punches = await Timeclock.find({ employee: emp._id, date: { $in: dates } });
+
+    let totalMinutes = 0;
+    let pendingCount = 0;
+    let completedCount = 0;
+
+    punches.forEach(p => {
+      if (p.checkOut) {
+        totalMinutes += (p.totalMinutes || 0);
+        completedCount++;
+        if (!p.isApproved) pendingCount++;
+      } else {
+        const diffMs = new Date() - new Date(p.checkIn);
+        totalMinutes += Math.max(0, Math.floor(diffMs / 60000));
+        pendingCount++;
+      }
+    });
+
+    const actualHours = parseFloat((totalMinutes / 60).toFixed(2));
+    const contractHours = emp.contractHours || 35;
+    const extraHours = actualHours > contractHours ? parseFloat((actualHours - contractHours).toFixed(2)) : 0;
+
+    const isFullyApproved = completedCount > 0 && pendingCount === 0;
+
+    summaries.push({
+      employee: emp,
+      contractHours,
+      actualHours,
+      extraHours,
+      isFullyApproved,
+      pendingCount,
+      completedCount
+    });
+  }
+
+  res.json(summaries);
+}));
+
+// 6. BULK APPROVE / LOCK ALL TIMESHEETS FOR A WEEK (With Date Range limits) [2]
+router.put('/admin/approve-all', authenticateToken, requirePermission('employees:edit'), asyncHandler(async (req, res) => {
+  const { weekStartDate } = req.body; 
+  let query = { checkOut: { $ne: null }, isApproved: false };
+
+  if (weekStartDate) {
+    const dates = [];
+    const startDate = new Date(weekStartDate.replace(/-/g, '/')); // Force slash parsing [1.1.4]
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(startDate);
+      d.setDate(startDate.getDate() + i);
+      dates.push(d.toLocaleDateString('fr-CA'));
+    }
+    query.date = { $in: dates };
+  }
+
+  const result = await Timeclock.updateMany(query, {
+    isApproved: true,
+    approvedBy: req.user.id
+  });
+
+  req.app.get('io').emit('timeclock_updated');
+
+  res.json({
+    message: `${result.modifiedCount} fiches de temps ont été approuvées et verrouillées avec succès.`,
+    modifiedCount: result.modifiedCount
+  });
+}));
+
+// 7. MANUALLY CREATE A TIMESHEET (With Mongoose ACID Transaction session protection) [1, 2]
+router.post('/admin/create', authenticateToken, requirePermission('employees:edit'), asyncHandler(async (req, res) => {
+  const { employeeId, date, checkInTime, checkOutTime, breakMinutes, shiftType, checkInTime2, checkOutTime2, breakMinutes2 } = req.body;
+
+  if (!employeeId || !date || !shiftType) {
+    return res.status(400).json({ message: 'L employé, la date et le type de shift sont requis.' });
+  }
+
+  const employee = await User.findById(employeeId);
+  if (!employee) return res.status(404).json({ message: 'Employé introuvable.' });
+
+  // 🛑 START TRANSACTION SESSION [2]
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    // ------------------------------------------
+    // DYNAMIC DOUBLE SHIFT SPLITTING PATH [2]
+    // ------------------------------------------
+    if (shiftType === 'double') {
+      if (!checkInTime || !checkOutTime || !checkInTime2 || !checkOutTime2) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({ message: 'Les heures pour les deux shifts sont requises.' });
+      }
+
+      // Compile Shift 1 (Midi)
+      const checkInDate1 = new Date(`${date}T${checkInTime}:00`);
+      const checkOutDate1 = new Date(`${date}T${checkOutTime}:00`);
+      if (checkOutDate1 <= checkInDate1) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({ message: 'L heure de départ du Shift 1 doit être après l heure d arrivée.' });
+      }
+      const mins1 = Math.floor((checkOutDate1 - checkInDate1) / 60000);
+      const totalMinutes1 = Math.max(0, mins1 - parseInt(breakMinutes || 0));
+
+      // Compile Shift 2 (Soir)
+      const checkInDate2 = new Date(`${date}T${checkInTime2}:00`);
+      const checkOutDate2 = new Date(`${date}T${checkOutTime2}:00`);
+      if (checkOutDate2 <= checkInDate2) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({ message: 'L heure de départ du Shift 2 doit être après l heure d arrivée.' });
+      }
+      const mins2 = Math.floor((checkOutDate2 - checkInDate2) / 60000);
+      const totalMinutes2 = Math.max(0, mins2 - parseInt(breakMinutes2 || 0));
+
+      // Build both documents [2]
+      const timesheetMidi = new Timeclock({
+        employee: employeeId,
+        date,
+        checkIn: checkInDate1,
+        checkOut: checkOutDate1,
+        totalMinutes: totalMinutes1,
+        breakMinutes: parseInt(breakMinutes || 0),
+        shiftType: 'midi',
+        isApproved: false
+      });
+
+      const timesheetSoir = new Timeclock({
+        employee: employeeId,
+        date,
+        checkIn: checkInDate2,
+        checkOut: checkOutDate2,
+        totalMinutes: totalMinutes2,
+        breakMinutes: parseInt(breakMinutes2 || 0),
+        shiftType: 'soir',
+        isApproved: false
+      });
+
+      // Save both INSIDE the transaction session [2]
+      await timesheetMidi.save({ session });
+      await timesheetSoir.save({ session });
+
+      await session.commitTransaction();
+      session.endSession();
+
+      req.app.get('io').emit('timeclock_updated');
+      return res.status(201).json({ message: 'Double shift créé et séparé avec succès.' });
     }
 
-    const employee = await User.findById(employeeId);
-    if (!employee)
-      return res.status(404).json({ message: "Employé introuvable." });
-
+    // ------------------------------------------
+    // STANDARD SINGLE SHIFT PATH (Midi, Soir, Repos, Conge) [2]
+    // ------------------------------------------
     let checkInDate = null;
     let checkOutDate = null;
     let totalMinutes = 0;
 
-    // 🛑 Calculation Logic based on Shift Type [2]
-    if (shiftType === "conge") {
-      totalMinutes = 420; // Automatically credit 7 hours (420 mins) for Paid Leave
-    } else if (shiftType === "repos") {
-      totalMinutes = 0; // 0 hours for Day Off
+    if (shiftType === 'conge') {
+      totalMinutes = 420; // 7 hours
+    } else if (shiftType === 'repos') {
+      totalMinutes = 0;
     } else {
-      // Standard Work Shift (Midi, Soir, or Double)
       if (!checkInTime || !checkOutTime) {
-        return res
-          .status(400)
-          .json({
-            message:
-              "Les heures d arrivée et de départ sont requises pour un shift de travail.",
-          });
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({ message: 'Les heures d arrivée et de départ sont requises.' });
       }
 
       checkInDate = new Date(`${date}T${checkInTime}:00`);
       checkOutDate = new Date(`${date}T${checkOutTime}:00`);
 
       if (checkOutDate <= checkInDate) {
-        return res
-          .status(400)
-          .json({
-            message: "L heure de départ doit être après l heure d arrivée.",
-          });
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({ message: 'L heure de départ doit être après l heure d arrivée.' });
       }
 
       const diffMinutes = Math.floor((checkOutDate - checkInDate) / 60000);
-      // Subtract break minutes from total [2]
       totalMinutes = Math.max(0, diffMinutes - parseInt(breakMinutes || 0));
     }
 
@@ -675,199 +568,131 @@ router.post(
       totalMinutes,
       breakMinutes: parseInt(breakMinutes || 0),
       shiftType,
-      isApproved: false,
+      isApproved: false
     });
 
-    await newTimesheet.save();
-    req.app.get("io").emit("timeclock_updated");
+    // Save inside the session [2]
+    await newTimesheet.save({ session });
 
-    res
-      .status(201)
-      .json({
-        message: "Fiche de temps créée manuellement.",
-        timesheet: newTimesheet,
-      });
-  }),
-);
+    await session.commitTransaction();
+    session.endSession();
 
-router.put(
-  "/admin/approve-all",
-  authenticateToken,
-  requirePermission("employees:edit"),
-  asyncHandler(async (req, res) => {
-    const { weekStartDate } = req.body;
-    let query = { checkOut: { $ne: null }, isApproved: false };
+    req.app.get('io').emit('timeclock_updated');
 
-    if (weekStartDate) {
-      const dates = [];
-      const startDate = new Date(weekStartDate);
-      for (let i = 0; i < 7; i++) {
-        const d = new Date(startDate);
-        d.setDate(startDate.getDate() + i);
-        dates.push(d.toLocaleDateString("fr-CA"));
-      }
-      query.date = { $in: dates };
+    res.status(201).json({ message: 'Fiche de temps créée manuellement.', timesheet: newTimesheet });
+
+  } catch (error) {
+    // Roll back if any part of the double save fails, preventing orphan records [2]
+    await session.abortTransaction();
+    session.endSession();
+    throw new Error(error.message);
+  }
+}));
+
+// =========================================================================
+// 🛑 WILDCARD DYNAMIC ROUTES (Placed below static entries) [1]
+// =========================================================================
+
+// 8. APPROVE / LOCK A SINGLE TIMESHEET
+router.put('/:id/approve', authenticateToken, requirePermission('employees:edit'), asyncHandler(async (req, res) => {
+  const timesheet = await Timeclock.findById(req.params.id);
+  if (!timesheet) return res.status(404).json({ message: 'Fiche de temps introuvable.' });
+
+  if (!timesheet.checkOut) {
+    return res.status(400).json({ message: 'Impossible d approuver une session encore active.' });
+  }
+
+  timesheet.isApproved = true;
+  timesheet.approvedBy = req.user.id;
+  await timesheet.save();
+
+  req.app.get('io').emit('timeclock_updated');
+
+  res.json({ message: 'Fiche approuvée et verrouillée.', timesheet });
+}));
+
+// 9. UNLOCK A LOCKED TIMESHEET [1]
+router.put('/:id/unlock', authenticateToken, requirePermission('employees:edit'), asyncHandler(async (req, res) => {
+  const timesheet = await Timeclock.findById(req.params.id);
+  if (!timesheet) return res.status(404).json({ message: 'Fiche introuvable.' });
+
+  timesheet.isApproved = false;
+  timesheet.approvedBy = null; 
+  await timesheet.save();
+
+  req.app.get('io').emit('timeclock_updated'); 
+
+  res.json({ message: 'Fiche de temps déverrouillée.', timesheet });
+}));
+
+// 10. MANUALLY EDIT/CORRECT A TIMESHEET (With Break Subtraction) [2]
+router.put('/:id', authenticateToken, requirePermission('employees:edit'), asyncHandler(async (req, res) => {
+  const { checkInTime, checkOutTime, date, breakMinutes, shiftType } = req.body;
+
+  const timesheet = await Timeclock.findById(req.params.id);
+  if (!timesheet) return res.status(404).json({ message: 'Fiche de temps introuvable.' });
+
+  if (timesheet.isApproved) {
+    return res.status(400).json({ message: 'Cette fiche est verrouillée et ne peut plus être modifiée.' });
+  }
+
+  const targetDateStr = date || timesheet.date;
+  const targetShiftType = shiftType || timesheet.shiftType;
+
+  let checkInDate = null;
+  let checkOutDate = null;
+  let totalMinutes = 0;
+
+  if (targetShiftType === 'conge') {
+    totalMinutes = 420; // 7 hours
+  } else if (targetShiftType === 'repos') {
+    totalMinutes = 0;
+  } else {
+    const activeCheckInTime = checkInTime || (timesheet.checkIn ? new Date(timesheet.checkIn).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : null);
+    const activeCheckOutTime = checkOutTime || (timesheet.checkOut ? new Date(timesheet.checkOut).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }) : null);
+
+    if (!activeCheckInTime || !activeCheckOutTime) {
+      return res.status(400).json({ message: 'Les heures d arrivée et de départ sont requises.' });
     }
 
-    const result = await Timeclock.updateMany(query, {
-      isApproved: true,
-      approvedBy: req.user.id,
-    });
+    checkInDate = new Date(`${targetDateStr}T${activeCheckInTime}:00`);
+    checkOutDate = new Date(`${targetDateStr}T${activeCheckOutTime}:00`);
 
-    req.app.get("io").emit("timeclock_updated");
-
-    res.json({
-      message: `${result.modifiedCount} fiches de temps ont été approuvées et verrouillées avec succès.`,
-      modifiedCount: result.modifiedCount,
-    });
-  }),
-);
-
-// ==========================================
-//MANUALLY EDIT/CORRECT A TIMESHEET (With Break Subtraction) [2]
-// ==========================================
-router.put(
-  "/admin/:id",
-  authenticateToken,
-  requirePermission("employees:edit"),
-  asyncHandler(async (req, res) => {
-    const { checkInTime, checkOutTime, date, breakMinutes, shiftType } =
-      req.body;
-
-    const timesheet = await Timeclock.findById(req.params.id);
-    if (!timesheet)
-      return res.status(404).json({ message: "Fiche de temps introuvable." });
-
-    if (timesheet.isApproved) {
-      return res
-        .status(400)
-        .json({
-          message: "Cette fiche est verrouillée et ne peut plus être modifiée.",
-        });
+    if (checkOutDate <= checkInDate) {
+      return res.status(400).json({ message: 'L heure de départ doit être après l heure d arrivée.' });
     }
 
-    const targetDateStr = date || timesheet.date;
-    const targetShiftType = shiftType || timesheet.shiftType;
+    const diffMinutes = Math.floor((checkOutDate - checkInDate) / 60000);
+    const activeBreak = breakMinutes !== undefined ? parseInt(breakMinutes) : timesheet.breakMinutes;
+    totalMinutes = Math.max(0, diffMinutes - activeBreak);
+  }
 
-    let checkInDate = null;
-    let checkOutDate = null;
-    let totalMinutes = 0;
+  timesheet.date = targetDateStr;
+  timesheet.shiftType = targetShiftType;
+  timesheet.checkIn = checkInDate;
+  timesheet.checkOut = checkOutDate;
+  timesheet.totalMinutes = totalMinutes;
+  timesheet.breakMinutes = breakMinutes !== undefined ? parseInt(breakMinutes) : timesheet.breakMinutes;
+  await timesheet.save();
 
-    // 🛑 Calculation Logic based on Shift Type [2]
-    if (targetShiftType === "conge") {
-      totalMinutes = 420; // 7 hours
-    } else if (targetShiftType === "repos") {
-      totalMinutes = 0;
-    } else {
-      // Standard Work Shift
-      const activeCheckInTime =
-        checkInTime ||
-        (timesheet.checkIn
-          ? new Date(timesheet.checkIn).toLocaleTimeString("fr-FR", {
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-          : null);
-      const activeCheckOutTime =
-        checkOutTime ||
-        (timesheet.checkOut
-          ? new Date(timesheet.checkOut).toLocaleTimeString("fr-FR", {
-              hour: "2-digit",
-              minute: "2-digit",
-            })
-          : null);
+  req.app.get('io').emit('timeclock_updated');
 
-      if (!activeCheckInTime || !activeCheckOutTime) {
-        return res
-          .status(400)
-          .json({
-            message: "Les heures d arrivée et de départ sont requises.",
-          });
-      }
+  res.json({ message: 'Fiche de temps corrigée avec succès.', timesheet });
+}));
 
-      checkInDate = new Date(`${targetDateStr}T${activeCheckInTime}:00`);
-      checkOutDate = new Date(`${targetDateStr}T${activeCheckOutTime}:00`);
+// 11. DELETE A TIMESHEET [1]
+router.delete('/:id', authenticateToken, requirePermission('employees:delete'), asyncHandler(async (req, res) => {
+  const timesheet = await Timeclock.findById(req.params.id);
+  if (!timesheet) return res.status(404).json({ message: 'Fiche introuvable.' });
 
-      if (checkOutDate <= checkInDate) {
-        return res
-          .status(400)
-          .json({
-            message: "L heure de départ doit être après l heure d arrivée.",
-          });
-      }
+  if (timesheet.isApproved) {
+    return res.status(400).json({ message: 'Impossible de supprimer une fiche verrouillée.' });
+  }
 
-      const diffMinutes = Math.floor((checkOutDate - checkInDate) / 60000);
-      const activeBreak =
-        breakMinutes !== undefined
-          ? parseInt(breakMinutes)
-          : timesheet.breakMinutes;
-      totalMinutes = Math.max(0, diffMinutes - activeBreak);
-    }
+  await Timeclock.findByIdAndDelete(req.params.id);
+  req.app.get('io').emit('timeclock_updated'); 
 
-    // Save corrections
-    timesheet.date = targetDateStr;
-    timesheet.shiftType = targetShiftType;
-    timesheet.checkIn = checkInDate;
-    timesheet.checkOut = checkOutDate;
-    timesheet.totalMinutes = totalMinutes;
-    timesheet.breakMinutes =
-      breakMinutes !== undefined
-        ? parseInt(breakMinutes)
-        : timesheet.breakMinutes;
-    await timesheet.save();
-
-    req.app.get("io").emit("timeclock_updated");
-
-    res.json({ message: "Fiche de temps corrigée avec succès.", timesheet });
-  }),
-);
-
-// ==========================================
-// 2. UNLOCK A LOCKED TIMESHEET [1]
-// ==========================================
-router.put(
-  "/admin/:id/unlock",
-  authenticateToken,
-  requirePermission("employees:edit"),
-  asyncHandler(async (req, res) => {
-    const timesheet = await Timeclock.findById(req.params.id);
-    if (!timesheet)
-      return res.status(404).json({ message: "Fiche introuvable." });
-
-    timesheet.isApproved = false;
-    timesheet.approvedBy = null; // Clear approval track
-    await timesheet.save();
-
-    req.app.get("io").emit("timeclock_updated"); // Trigger real-time dashboard updates [2]
-
-    res.json({ message: "Fiche de temps déverrouillée.", timesheet });
-  }),
-);
-
-// ==========================================
-// 3. DELETE A TIMESHEET [1]
-// ==========================================
-router.delete(
-  "/admin/:id",
-  authenticateToken,
-  requirePermission("employees:delete"),
-  asyncHandler(async (req, res) => {
-    const timesheet = await Timeclock.findById(req.params.id);
-    if (!timesheet)
-      return res.status(404).json({ message: "Fiche introuvable." });
-
-    // Safety block: Prevent deleting approved payroll records [1]
-    if (timesheet.isApproved) {
-      return res
-        .status(400)
-        .json({ message: "Impossible de supprimer une fiche verrouillée." });
-    }
-
-    await Timeclock.findByIdAndDelete(req.params.id);
-    req.app.get("io").emit("timeclock_updated"); // Trigger real-time dashboard updates [2]
-
-    res.json({ message: "Fiche de temps supprimée avec succès." });
-  }),
-);
+  res.json({ message: 'Fiche de temps supprimée avec succès.' });
+}));
 
 module.exports = router;

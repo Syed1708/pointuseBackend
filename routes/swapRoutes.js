@@ -141,8 +141,11 @@ router.get('/admin/list', authenticateToken, requirePermission('employees:view')
   res.json(requests);
 }));
 
+
+const mongoose = require('mongoose'); // 🛑 1. Import mongoose to handle sessions [2]
+
 // ==========================================
-// 5. MANAGER FINALIZE SWAP (The Auto-Swap Logic) [1, 2]
+// 5. MANAGER FINALIZE SWAP (With Robust ACID Transaction Protection) [2]
 // ==========================================
 router.put('/admin/:id/status', authenticateToken, requirePermission('employees:edit'), asyncHandler(async (req, res) => {
   const { status } = req.body; // 'approved' or 'rejected'
@@ -158,11 +161,11 @@ router.put('/admin/:id/status', authenticateToken, requirePermission('employees:
   const userSockets = req.app.get('userSockets');
   const io = req.app.get('io');
 
+  // If rejected, no calendar updates are needed, so a simple write is fine
   if (status === 'rejected') {
     request.status = 'rejected';
     await request.save();
 
-    // Notify both employees
     const notifyUsers = [request.sender, request.receiver];
     for (const emp of notifyUsers) {
       const notification = new Notification({
@@ -178,63 +181,88 @@ router.put('/admin/:id/status', authenticateToken, requirePermission('employees:
     return res.json({ message: 'Échange rejeté.', request });
   }
 
-  // --------------------------------------------------
-  // 🛑 TRANSACTIONAL SCHEDULE SHIFT SWAP OPERATIONS [2]
-  // --------------------------------------------------
-  const senderMon = getMonday(request.senderDate);
-  const senderDayName = getWeekdayKey(request.senderDate);
+  // =========================================================================
+  // 🛑 2. START THE TRANSACTION SESSION (Protects against partial saves) [2]
+  // =========================================================================
+  const session = await mongoose.startSession(); // Starts a database session [2]
+  session.startTransaction(); // Opens the transaction block [2]
 
-  const receiverMon = getMonday(request.receiverDate);
-  const receiverDayName = getWeekdayKey(request.receiverDate);
+  try {
+    const senderMon = getMonday(request.senderDate);
+    const senderDayName = getWeekdayKey(request.senderDate);
 
-  // Load both schedules
-  const senderSchedule = await WeeklySchedule.findOne({ employee: request.sender._id, weekStartDate: senderMon });
-  const receiverSchedule = await WeeklySchedule.findOne({ employee: request.receiver._id, weekStartDate: receiverMon });
+    const receiverMon = getMonday(request.receiverDate);
+    const receiverDayName = getWeekdayKey(request.receiverDate);
 
-  if (!senderSchedule || !receiverSchedule) {
-    return res.status(400).json({ message: 'Impossible de permuter : Calendriers introuvables.' });
+    // Load both weekly schedule documents WITHIN the active session [2]
+    const senderSchedule = await WeeklySchedule.findOne({ employee: request.sender._id, weekStartDate: senderMon }).session(session);
+    const receiverSchedule = await WeeklySchedule.findOne({ employee: request.receiver._id, weekStartDate: receiverMon }).session(session);
+
+    if (!senderSchedule || !receiverSchedule) {
+      throw new Error('Impossible de permuter : Calendriers introuvables.');
+    }
+
+    // Extract shift references
+    const senderShifts = senderSchedule.days[senderDayName].shifts;
+    const receiverShifts = receiverSchedule.days[receiverDayName].shifts;
+
+    const senderShiftObj = senderShifts[request.senderShiftIndex];
+    const receiverShiftObj = receiverShifts[request.receiverShiftIndex];
+
+    // Swap the shift objects in the arrays
+    senderShifts[request.senderShiftIndex] = receiverShiftObj;
+    receiverShifts[request.receiverShiftIndex] = senderShiftObj;
+
+    // Recalculate weekly totals
+    senderSchedule.totalHours = calculateWeeklyHours(senderSchedule.days);
+    receiverSchedule.totalHours = calculateWeeklyHours(receiverSchedule.days);
+
+    // Save both schedules INSIDE the session [2]
+    await senderSchedule.save({ session });
+    await receiverSchedule.save({ session });
+
+    // Update swap request status INSIDE the session [2]
+    request.status = 'approved';
+    request.approvedBy = req.user.id;
+    await request.save({ session });
+
+    // Create notification documents INSIDE the session [2]
+    const notifyUsers = [request.sender, request.receiver];
+    for (const emp of notifyUsers) {
+      const notification = new Notification({
+        recipient: emp._id,
+        title: '✅ Shift Swap Approved!',
+        message: `Your shift swap from ${request.senderDate} to ${request.receiverDate} has been approved.`
+      });
+      await notification.save({ session }); // Saved under session lock! [2]
+    }
+
+    // 🏆 3. COMMIT TRANSACTION: Write all changes to MongoDB simultaneously [2]
+    await session.commitTransaction(); 
+    session.endSession(); // Close session safely
+
+    // Emit live socket updates now that the database transaction is fully finalized [2]
+    io.emit('schedule_updated');
+
+    for (const emp of notifyUsers) {
+      const socketId = userSockets.get(emp._id.toString());
+      if (socketId) {
+        // Fetch the newly created notification to emit [2]
+        const latestNotif = await Notification.findOne({ recipient: emp._id }).sort({ createdAt: -1 });
+        io.to(socketId).emit('notification_received', latestNotif);
+      }
+    }
+
+    res.json({ message: 'Planning modifié et validé avec succès.', request });
+
+  } catch (error) {
+    // 🛑 4. ROLLBACK / ABORT TRANSACTION: If any step fails, undo everything! [2]
+    await session.abortTransaction(); 
+    session.endSession(); // Close session safely
+    
+    // Pass the error to your central errorHandler [2]
+    throw new Error(error.message); 
   }
-
-  // Extract shift references
-  const senderShifts = senderSchedule.days[senderDayName].shifts;
-  const receiverShifts = receiverSchedule.days[receiverDayName].shifts;
-
-  const senderShiftObj = senderShifts[request.senderShiftIndex];
-  const receiverShiftObj = receiverShifts[request.receiverShiftIndex];
-
-  // Swap the objects in their arrays securely [2]
- senderShifts[request.senderShiftIndex] = receiverShiftObj;
-  receiverShifts[request.receiverShiftIndex] = senderShiftObj;
-
-  // Recalculate totals and save
-  senderSchedule.totalHours = calculateWeeklyHours(senderSchedule.days);
-  receiverSchedule.totalHours = calculateWeeklyHours(receiverSchedule.days);
-
-  await senderSchedule.save();
-  await receiverSchedule.save();
-
-  // Save request completion
-  request.status = 'approved';
-  request.approvedBy = req.user.id;
-  await request.save();
-
-  // Live reload planning grids [2, 3]
-  io.emit('schedule_updated');
-
-  // Notify both employees
-  const notifyUsers = [request.sender, request.receiver];
-  for (const emp of notifyUsers) {
-    const notification = new Notification({
-      recipient: emp._id,
-      title: '✅ Shift Swap Approved!',
-      message: `Your shift swap from ${request.senderDate} to ${request.receiverDate} has been approved and applied.`
-    });
-    await notification.save();
-    const socketId = userSockets.get(emp._id.toString());
-    if (socketId) io.to(socketId).emit('notification_received', notification);
-  }
-
-  res.json({ message: 'Planning modifié et validé avec succès.', request });
 }));
 
 module.exports = router;
